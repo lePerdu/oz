@@ -1,0 +1,26 @@
+// Project tasks configuration. See https://zed.dev/docs/tasks for documentation.
+//
+// Example:
+[
+  {
+    "label": "Build",
+    "command": "zig",
+    "args": ["build"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true
+  },
+  {
+    "label": "Run in QEMU",
+    "command": "zig",
+    "args": ["build", "run"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Debug in QEMU",
+    "command": "zig",
+    "args": ["build", "debug"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  }
+]

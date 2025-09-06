@@ -1,0 +1,12 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  {
+    "label": "Debug",
+    "adapter": "GDB",
+    "request": "attach",
+    "target": "localhost:1234"
+  }
+]

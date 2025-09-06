@@ -1,0 +1,51 @@
+CR3=00000001DEADB000;
+
+# PHYSICAL
+00000000DEADB000 (PML4)
+0: 2(000)
+1: 3(000)
+...
+511: DEADB(000)
+
+2000 (PDPT)
+0: 4(000)
+1: 5(000)
+...
+
+3000 (PDPT)
+0: A(000)
+1: B(000)
+...
+
+4000 (PD)
+0: 6(000)
+1: 7(000)
+...
+
+6000 (PT)
+0: 8(000)
+1: 9(000)
+...
+
+8000, 9000: data
+
+# VIRTUAL
+(FFFF)[511][511][511][511][0] = PML4
+
+(FFFF)[511][511][511][0][0] = PDPT(0)
+(FFFF)[511][511][511][1][0] = PDPT(1)
+
+(FFFF)[511][511][0][0][0] = PDPT(0).PD(0)
+(FFFF)[511][511][1][0][0] = PDPT(1).PD(0)
+
+(FFFF)[511][511][0][0][0] = PDPT(0).PD(0)
+(FFFF)[511][511][1][511][0] = PDPT(0).PD(0)
+
+# Identity map size
+TODO: Use 1GB pages?
+
+N pages
+N/512 page tables
+N/512/512 page directories
+N/512/512/512 page directory pointer tables
+N/512/512/512/512 page map level 4 tables
