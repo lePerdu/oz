@@ -415,33 +415,37 @@ fn createIdentityPageTables(page_count: usize) !*paging.PageTable {
     return pml4;
 }
 
-fn queryMemMap() !ozlib.MemoryMap {
+fn queryMemMap() !uefi.tables.MemoryMapSlice {
     const log = std.log.scoped(.queryMemMap);
     const boot_services = uefi.system_table.boot_services.?;
 
     log.debug("querying memory map size", .{});
 
     // Call once to find the table size
-    const mem_map_info = try boot_services.getMemoryMapInfo();
+    var mem_map_info = try boot_services.getMemoryMapInfo();
     log.info("memory map requires size: {}", .{mem_map_info.len});
 
     if (mem_map_info.len == 0) {
         log.err("could not retrieve memory map size", .{});
         return error.FailedInit;
     }
-    if (mem_map_info.descriptor_size == 0) {
-        log.warn("could not retrieve exact descriptor size", .{});
+    const default_descriptor_size = @sizeOf(uefi.tables.MemoryDescriptor);
+    if (mem_map_info.descriptor_size < default_descriptor_size) {
+        log.warn("invalid memory descriptor size: {}; using default: {}", .{ mem_map_info.descriptor_size, default_descriptor_size });
+        mem_map_info.descriptor_size = default_descriptor_size;
     }
 
     // Add some size so the table can expand after the allocation
-    const mem_map_req_len = (mem_map_info.len + 2) * @max(mem_map_info.descriptor_size, @sizeOf(uefi.tables.MemoryDescriptor));
-    log.info("allocating {} bytes for memory map", .{mem_map_req_len});
+    const buf_len = (mem_map_info.len + 2) * mem_map_info.descriptor_size;
+    log.info("allocating {} bytes for memory map", .{buf_len});
 
-    uefi.efi_pool_memory_type = @enumFromInt(0x8deadbee);
+    // Use poll_allocator here since this doesn't need to be passed onto the OS
+    // NOTE: This is not explicitly freed; it is just not marked as special in the memory map given to the OS
+    // TODO: Use custom memory descriptor type?
     const mem_map_buf = try uefi.pool_allocator.alignedAlloc(
         u8,
         .of(uefi.tables.MemoryDescriptor),
-        mem_map_req_len,
+        buf_len,
     );
 
     log.debug("querying memory map", .{});
@@ -456,10 +460,8 @@ fn queryMemMap() !ozlib.MemoryMap {
         },
     };
 
-    log.debug("queried memory map: key={}, ptr={*}", .{ mem_map.info.key, mem_map_buf });
-
-    // TODO: Replace with Zig's new MemoryMapSlice type
-    return ozlib.MemoryMap.fromByteBuffer(@intFromEnum(mem_map.info.key), mem_map_buf, mem_map.info.len, mem_map.info.descriptor_size);
+    log.debug("queried memory map: key={}, ptr={*}", .{ mem_map.info.key, mem_map.ptr });
+    return mem_map;
 }
 
 fn memDescContains(desc: *uefi.tables.MemoryDescriptor, ptr: ?*anyopaque) bool {
@@ -489,7 +491,7 @@ fn getMemEntType(desc: *uefi.tables.MemoryDescriptor) ozlib.bootboot.MMapType {
 
 fn parseMemMap(
     bootinfo: *ozlib.bootboot.Bootboot,
-    mem_map: *ozlib.MemoryMap,
+    mem_map: uefi.tables.MemoryMapSlice,
 ) !void {
     var dst_buf = bootinfo.mmapEntriesBuf();
     var dst_index: usize = 0;
@@ -498,6 +500,7 @@ fn parseMemMap(
 
     var iter = mem_map.iterator();
     while (iter.next()) |entry| {
+        std.log.debug("UEFI mem map entry: {}", .{entry});
         if (dst_index >= ozlib.bootboot.Bootboot.max_mmap_entries) {
             return error.TooManyMemoryMapEntries;
         }
@@ -521,52 +524,11 @@ fn parseMemMap(
     }
     // TODO: Don't assume sorted?
 
-    bootinfo.setComputedSize(dst_index);
-}
+    bootinfo.setMMapEntriesLen(dst_index);
 
-fn printMemMap(mem_map: *const ozlib.MemoryMap) void {
-    std.log.info("memory map:", .{});
-    std.log.info("memory type\tphysical\tvirtual\tpages\tattr", .{});
-    var mem_map_iter = mem_map.iterator();
-    var loader_size: usize = 0;
-    var boot_services_size: usize = 0;
-    var runtime_services_size: usize = 0;
-    var acpi_size: usize = 0;
-    var free_size: usize = 0;
-    while (mem_map_iter.next()) |descriptor_ptr| {
-        switch (descriptor_ptr.type) {
-            .loader_code, .loader_data => loader_size += descriptor_ptr.number_of_pages,
-            .runtime_services_code, .runtime_services_data => runtime_services_size += descriptor_ptr.number_of_pages,
-            .boot_services_code, .boot_services_data => boot_services_size += descriptor_ptr.number_of_pages,
-            .conventional_memory => free_size += descriptor_ptr.number_of_pages,
-            .acpi_memory_nvs, .acpi_reclaim_memory => acpi_size += descriptor_ptr.number_of_pages,
-            else => {
-                std.log.info("{}\t0x{x:016}\t0x{x:016}\t{}\t{}", .{
-                    descriptor_ptr.type,
-                    descriptor_ptr.physical_start,
-                    descriptor_ptr.virtual_start,
-                    descriptor_ptr.number_of_pages,
-                    descriptor_ptr.attribute,
-                });
-            },
-        }
-
-        // var ev_index: usize = 0;
-        // _ = boot_services.waitForEvent(
-        //     1,
-        //     &[1]uefi.Event{con_in.wait_for_key},
-        //     &ev_index,
-        // );
-        // var key: uefi.protocol.SimpleTextInput.Key.Input = undefined;
-        // _ = con_in.readKeyStroke(&key);
+    for (bootinfo.mmapEntries()) |entry| {
+        std.log.debug("Bootboot mem map entry: {}", .{.{ .ptr = entry.ptr, .size = entry.getSizeBytes(), .type = entry.getType() }});
     }
-
-    std.log.info("boot UEFI space: {} MiB", .{boot_services_size * 4096 / (1 << 20)});
-    std.log.info("runtime UEFI space: {} MiB", .{runtime_services_size * 4096 / (1 << 20)});
-    std.log.info("loader space: {} MiB", .{loader_size * 4096 / (1 << 20)});
-    std.log.info("ACPI space: {} MiB", .{acpi_size * 4096 / (1 << 20)});
-    std.log.info("free space: {} MiB", .{free_size * 4096 / (1 << 20)});
-    std.log.info("OS free space: {} MiB", .{(free_size + boot_services_size + loader_size) * 4096 / (1 << 20)});
 }
 
 fn getBspid() u16 {
@@ -583,6 +545,7 @@ fn getBspid() u16 {
 fn initBootboot(fb: *uefi.protocol.GraphicsOutput) !*ozlib.bootboot.Bootboot {
     const bootboot_pages = try uefi.system_table.boot_services.?.allocatePages(
         .any,
+        // TODO: Custom type?
         .loader_data,
         1,
     );
@@ -672,16 +635,20 @@ fn zigMain() !void {
     const bootboot = try initBootboot(fb);
     log.debug("allocated bootboot structure: {*}", .{bootboot});
 
+    const watch_ptr: *volatile u32 = @ptrFromInt(0x10000);
+    const base_ptr: *volatile u64 = @ptrFromInt(0x10008);
+    watch_ptr.* = 0xDEADBEEF;
+    base_ptr.* = @intFromPtr(loaded_image.image_base);
+
     const kernel_pages = try loadKernel();
 
     const pml4 = try createPageTables(bootboot, kernel_pages);
 
-    var mem_map = try queryMemMap();
-
-    try parseMemMap(bootboot, &mem_map);
+    const mem_map = try queryMemMap();
+    try parseMemMap(bootboot, mem_map);
 
     log.debug("exiting boot services", .{});
-    uefi.system_table.boot_services.?.exitBootServices(uefi.handle, @enumFromInt(mem_map.key)) catch |err| {
+    uefi.system_table.boot_services.?.exitBootServices(uefi.handle, mem_map.info.key) catch |err| {
         std.log.err("failed to exit: {}", .{err});
         return err;
     };
@@ -691,11 +658,6 @@ fn zigMain() !void {
     paging.setRootPageTable(@intFromPtr(pml4));
 
     log.debug("entering kernel: {x}", .{ozlib.bootboot.kernel_start});
-
-    const watch_ptr: *volatile u32 = @ptrFromInt(0x10000);
-    const base_ptr: *volatile u64 = @ptrFromInt(0x10008);
-    watch_ptr.* = 0xDEADBEEF;
-    base_ptr.* = @intFromPtr(loaded_image.image_base);
 
     // xor trick when kernel stack starts at 0
     comptime std.debug.assert(ozlib.bootboot.kernel_stack_init == 0);

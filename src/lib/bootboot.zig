@@ -54,7 +54,7 @@ pub const Bootboot = extern struct {
         return @intCast(@offsetOf(Self, "mmap") + mmap_entries * @sizeOf(MMapEnt));
     }
 
-    pub fn setComputedSize(self: *Self, mmap_entries: usize) void {
+    pub fn setMMapEntriesLen(self: *Self, mmap_entries: usize) void {
         self.size = computeSize(mmap_entries);
     }
 

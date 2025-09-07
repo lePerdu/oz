@@ -3,7 +3,6 @@ const uefi = std.os.uefi;
 
 const paging = @import("./paging.zig");
 const bootboot = @import("./bootboot.zig");
-const memmap = @import("./memmap.zig");
 
 /// Interface for allocating physical pages (1 at a time)
 /// TODO: Extend interface to allocate chunks of physical pages
