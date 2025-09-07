@@ -9,5 +9,11 @@
         "enable_build_on_save": true
       }
     }
+  },
+  "dap": {
+    "GDB": {
+      "binary": "gdb",
+      "args": ["-i=dap", "--nx", "--command=.gdbinit.zed"]
+    }
   }
 }
