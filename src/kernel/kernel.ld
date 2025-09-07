@@ -38,11 +38,11 @@ SECTIONS {
         _kernel_data_start = .;
         *(.data*);
         _kernel_data_end = .;
-    }
-    .bss : {
+
+        /* TODO: Put .bss in .bss section once the loader supports ELF */
         _kernel_bss_start = .;
-        *(COMMON);
         *(.bss*);
+        *(COMMON);
         _kernel_bss_end = .;
     }
 
