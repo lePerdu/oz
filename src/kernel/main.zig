@@ -93,13 +93,13 @@ export fn main() callconv(.{
         .height = bootboot.fb_height,
         .pixels_per_row = bootboot.fb_scanline,
     };
-    // renderImage(&video_fb) catch |err| {
-    //     std.log.err("error rendering image: {}", .{err});
-    // };
-    video_fb.fill(.{ .b = 255, .g = 255, .r = 0 }, .{
-        .base = .{ .x = 20, .y = 20 },
-        .size = .{ .x = 200, .y = 300 },
-    });
+    std.log.info("Frame buffer: width={} height={}", .{ video_fb.width, video_fb.height });
+    var x_offset: i32 = 0;
+    const y_offset: i32 = 0;
+    while (true) {
+        renderGradient(&video_fb, x_offset, y_offset);
+        x_offset +%= 1;
+    }
 
     // switch (kallocator.deinit()) {
     //     .ok => {},
@@ -110,6 +110,20 @@ export fn main() callconv(.{
 
     std.log.info("done", .{});
     kdebug.halt();
+}
+
+fn renderGradient(video_fb: *ozlib.FrameBuffer, x_offset: i32, y_offset: i32) void {
+    for (0..video_fb.height) |y| {
+        const y_: i32 = @intCast(y);
+        for (0..video_fb.width) |x| {
+            const x_: i32 = @intCast(x);
+            video_fb.set(x, y, .{
+                .r = 0,
+                .g = @intCast((y_ + y_offset) & 0xFF),
+                .b = @intCast((x_ + x_offset) & 0xFF),
+            });
+        }
+    }
 }
 
 pub const kernel_heap_vma_start: paging.VirtualAddress = 0xFFFF_C000_0000_0000;
