@@ -13,7 +13,7 @@ fn includeCpuQuery(base: *const std.Target.Query, query: std.Target.Query) std.T
 // declaratively construct a build graph that will be executed by an external
 // runner.
 pub fn build(b: *std.Build) void {
-    b.enable_qemu = true;
+    // b.enable_qemu = true;
 
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -147,6 +147,8 @@ pub fn build(b: *std.Build) void {
     const kernel_check = b.addExecutable(.{
         .name = "check-ozkernel",
         .root_module = kernel_mod,
+        // Without this, the LSP has errors because it can't handle interrupt callconv
+        .use_llvm = true,
     });
     const kernel_lib_check = b.addLibrary(.{
         .name = "check-ozloader-lib",

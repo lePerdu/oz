@@ -1,7 +1,16 @@
 .code64
 .section .text.start
 
-.globl _start
+.global _start
 _start:
-    cli
     jmp main
+
+.global _setCodeSegmentRegister
+_setCodeSegmentRegister:
+    /* di = segment selector */
+    push %rdi
+    lea _reload_cs, %rax
+    push %rax
+    lretq
+_reload_cs:
+    ret

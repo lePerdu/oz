@@ -647,6 +647,9 @@ fn zigMain() !void {
     const mem_map = try queryMemMap();
     try parseMemMap(bootboot, mem_map);
 
+    log.info("current GDT: base={x} limit={}", .{ ozlib.interrupt.getGdtr().base, ozlib.interrupt.getGdtr().limit });
+    log.info("current IDT: base={x} limit={}", .{ ozlib.interrupt.getIdtr().base, ozlib.interrupt.getIdtr().limit });
+
     log.debug("exiting boot services", .{});
     uefi.system_table.boot_services.?.exitBootServices(uefi.handle, mem_map.info.key) catch |err| {
         std.log.err("failed to exit: {}", .{err});
@@ -656,6 +659,9 @@ fn zigMain() !void {
 
     log.debug("setting up page table: {*}", .{pml4});
     paging.setRootPageTable(@intFromPtr(pml4));
+
+    ozlib.interrupt.picSetMask(0xFFFF);
+    ozlib.interrupt.nmiDisable();
 
     log.debug("entering kernel: {x}", .{ozlib.bootboot.kernel_start});
 
