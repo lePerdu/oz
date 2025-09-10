@@ -660,7 +660,7 @@ fn zigMain() !void {
     log.debug("setting up page table: {*}", .{pml4});
     paging.setRootPageTable(@intFromPtr(pml4));
 
-    ozlib.interrupt.picSetMask(0xFFFF);
+    ozlib.interrupt.pic.setEnabled(.{});
     ozlib.interrupt.nmiDisable();
 
     log.debug("entering kernel: {x}", .{ozlib.bootboot.kernel_start});

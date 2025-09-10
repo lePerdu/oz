@@ -82,45 +82,124 @@ pub fn setCodeSegmentRegister(selector: SegmentSelector) void {
     _setCodeSegmentRegister(@bitCast(selector));
 }
 
-pub const PIC_MASTER_COMMAND_PORT = 0x20;
-pub const PIC_MASTER_DATA_PORT = 0x21;
-pub const PIC_SLAVE_COMMAND_PORT = 0xA0;
-pub const PIC_SLAVE_DATA_PORT = 0xA1;
+pub const pic = struct {
+    pub const MASTER_OFFSET = 0x20;
+    pub const SLAVE_OFFSET = MASTER_OFFSET + 8;
 
-pub inline fn picMasterSetMask(mask: u8) void {
-    port_io.outbComptimePort(PIC_MASTER_DATA_PORT, mask);
-}
+    const MASTER_COMMAND_PORT = 0x20;
+    const MASTER_DATA_PORT = 0x21;
+    const SLAVE_COMMAND_PORT = 0xA0;
+    const SLAVE_DATA_PORT = 0xA1;
 
-pub inline fn picSlaveSetMask(mask: u8) void {
-    port_io.outbComptimePort(PIC_SLAVE_DATA_PORT, mask);
-}
+    const EOI: u8 = 0x20;
 
-pub inline fn picSetMask(mask: u16) void {
-    picMasterSetMask(@truncate(mask));
-    picSlaveSetMask(@truncate(mask >> 8));
-}
+    const out = port_io.outbComptimePort;
+    const in = port_io.inbComptimePort;
 
-const PIC_EOI: u8 = 0x20;
-
-pub inline fn picMasterEoi() void {
-    port_io.outbComptimePort(PIC_MASTER_COMMAND_PORT, PIC_EOI);
-}
-
-pub inline fn picSlaveEoi() void {
-    port_io.outbComptimePort(PIC_SLAVE_COMMAND_PORT, PIC_EOI);
-}
-
-pub inline fn picBothEoi() void {
-    picSlaveEoi();
-    picMasterEoi();
-}
-
-pub fn picEoi(irq: u8) void {
-    if (irq >= 8) {
-        picSlaveEoi();
+    pub fn setMasterMask(mask: u8) void {
+        out(MASTER_DATA_PORT, mask);
     }
-    picMasterEoi();
-}
+
+    pub fn setSlaveMask(mask: u8) void {
+        out(SLAVE_DATA_PORT, mask);
+    }
+
+    pub fn setMask(mask: u16) void {
+        setMasterMask(@truncate(mask));
+        setSlaveMask(@truncate(mask >> 8));
+    }
+
+    pub const EnableSet = packed struct(u16) {
+        timer: bool = false,
+        keyboard: bool = false,
+        // This is enabled by default for convenience
+        cascade: bool = true,
+        com1: bool = false,
+        com2: bool = false,
+        lpt2: bool = false,
+        floppy: bool = false,
+        lpt1: bool = false,
+        cmos_rtc: bool = false,
+        free1: bool = false,
+        free2: bool = false,
+        free3: bool = false,
+        mouse: bool = false,
+        fpu: bool = false,
+        primary_ata: bool = false,
+        secondary_ata: bool = false,
+    };
+
+    pub fn setEnabled(mask: EnableSet) void {
+        const enabled: u16 = @bitCast(mask);
+        setMask(~enabled);
+    }
+
+    pub fn sendMasterEoi() void {
+        out(MASTER_COMMAND_PORT, EOI);
+    }
+
+    pub fn sendSlaveEoi() void {
+        out(SLAVE_COMMAND_PORT, EOI);
+    }
+
+    pub fn sendBothEoi() void {
+        sendSlaveEoi();
+        sendMasterEoi();
+    }
+
+    pub fn sedndEoi(irq: u4) void {
+        if (irq >= 8) {
+            sendSlaveEoi();
+        }
+        sendMasterEoi();
+    }
+
+    /// https://wiki.osdev.org/Inline_Assembly/Examples#IO_WAIT
+    fn ioWait() void {
+        out(0x80, 0);
+    }
+
+    /// Configure and map the PIC controllers
+    /// Leaves all interrupts masked
+    /// https://wiki.osdev.org/8259_PIC#Initialisation
+    pub fn configure() void {
+        // TODO: Figure out what all these other flags do
+        const ICW1_ICW4 = 0x01;
+        // const ICW1_SINGLE = 0x02;
+        // const ICW1_INTERVAL4 = 0x04;
+        // const ICW1_LEVEL = 0x08;
+        const ICW1_INIT = 0x10;
+
+        const ICW4_8086 = 0x10;
+        // const ICW4_AUTO = 0x02;
+        // const ICW4_BUF_SLAVE = 0x08;
+        // const ICW4_BUF_MASTER = 0x0C;
+        // const ICW4_SFNM = 0x10;
+
+        const CASCADE_IRQ = 2;
+
+        // Disable before configuring
+        setMask(0xFFFF);
+
+        out(MASTER_COMMAND_PORT, ICW1_INIT | ICW1_ICW4);
+        ioWait();
+        out(SLAVE_COMMAND_PORT, ICW1_INIT | ICW1_ICW4);
+        ioWait();
+        out(MASTER_DATA_PORT, MASTER_OFFSET);
+        ioWait();
+        out(SLAVE_DATA_PORT, SLAVE_OFFSET);
+        ioWait();
+        out(MASTER_DATA_PORT, 1 << CASCADE_IRQ);
+        ioWait();
+        out(SLAVE_DATA_PORT, CASCADE_IRQ);
+        ioWait();
+
+        out(MASTER_DATA_PORT, ICW4_8086);
+        ioWait();
+        out(SLAVE_DATA_PORT, ICW4_8086);
+        ioWait();
+    }
+};
 
 pub fn nmiEnable() void {
     port_io.outbComptimePort(0x70, port_io.inbComptimePort(0x70) & 0x7F);
