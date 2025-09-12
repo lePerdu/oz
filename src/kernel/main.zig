@@ -60,6 +60,18 @@ var kernel_heap_state: struct {
     }
 } = .{};
 
+var global_keyboard_controller = keyboard.Controller{};
+var global_font = ozlib.font.Psf1Font.empty;
+const font_data align(2) = @embedFile("assets/Lat15-Terminus16.psf").*;
+
+var empty_fb = [0]ozlib.fb.Pixel{};
+var global_video_fb = ozlib.FrameBuffer{
+    .height = 0,
+    .width = 0,
+    .pixels_per_row = 0,
+    .raw = &empty_fb,
+};
+
 export fn main() callconv(.{
     .x86_64_sysv = .{
         // Normal stack alignment is 16 bytes before a `call` instruction. Since
@@ -80,6 +92,12 @@ export fn main() callconv(.{
         kdebug.halt();
     };
 
+    global_font = ozlib.font.Psf1Font.parse(os.heap.page_allocator, &font_data) catch |err| {
+        std.log.err("failed to load font: {}", .{err});
+        // TODO: Just continue on?
+        kdebug.halt();
+    };
+
     setupInterrupts() catch |err| {
         std.log.err("failed to setup GDT and IDT: {}", .{err});
         kdebug.halt();
@@ -90,14 +108,14 @@ export fn main() callconv(.{
     keyboard.configure();
     int.pic.setEnabled(.{ .keyboard = true });
 
-    var video_fb = ozlib.FrameBuffer{
+    global_video_fb = ozlib.FrameBuffer{
         .raw = @ptrCast(&fb),
         .width = bootboot.fb_width,
         .height = bootboot.fb_height,
         .pixels_per_row = bootboot.fb_scanline,
     };
-    std.log.info("Frame buffer: width={} height={}", .{ video_fb.width, video_fb.height });
-    renderGradient(&video_fb, 0, 0);
+    std.log.info("Frame buffer: width={} height={}", .{ global_video_fb.width, global_video_fb.height });
+    renderGradient(&global_video_fb, 0, 0);
     // var x_offset: i32 = 0;
     // const y_offset: i32 = 0;
     // while (true) {
@@ -111,6 +129,29 @@ export fn main() callconv(.{
     //         std.log.warn("leak detected", .{});
     //     },
     // }
+
+    const glyph = [_]u8{
+        0b00000110, 0b00000000,
+        0b00001111, 0b00000000,
+        0b00011001, 0b10000000,
+        0b00110000, 0b11000000,
+        0b01100000, 0b01100000,
+        0b11000000, 0b00110000,
+        0b11111111, 0b11110000,
+        0b11111111, 0b11110000,
+        0b11000000, 0b00110000,
+        0b11000000, 0b00110000,
+        0b11000000, 0b00110000,
+        0b11000000, 0b00110000,
+    };
+
+    ozlib.fb.renderBitmap(&global_video_fb, 100, 100, &glyph, .{
+        .fg = .fromRgb(255, 255, 255),
+        .bg = .fromRgb(0, 0, 0),
+        .width = 12,
+        .height = 12,
+        .padding = 1,
+    });
 
     std.log.info("done", .{});
     kdebug.halt();
@@ -328,8 +369,72 @@ fn int32Handler() callconv(.{ .x86_64_interrupt = .{} }) void {
     std.log.info("int 0x32!", .{});
 }
 
+var cursor_x: usize = 0;
+var cursor_y: usize = 0;
+const empty_glyph = std.mem.zeroes([64]u8);
+
 fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
-    keyboard.handleInterrupt();
+    const event = global_keyboard_controller.handleInterrupt() orelse return;
+    if (!event.pressed) return;
+    switch (event.code) {
+        .up => {
+            if (cursor_y > 0) cursor_y -= 1;
+            return;
+        },
+        .left => {
+            if (cursor_x > 0) cursor_x -= 1;
+            return;
+        },
+        .down => {
+            cursor_y += 1;
+            return;
+        },
+        .right => {
+            cursor_x += 1;
+            return;
+        },
+        .space => {
+            const x = cursor_x * (global_font.width + 1);
+            const y = cursor_y * (global_font.height);
+            ozlib.fb.renderBitmap(&global_video_fb, x, y, &empty_glyph, .{
+                .fg = .fromRgb(255, 255, 255),
+                .bg = .fromRgb(0, 0, 0),
+                .width = global_font.width,
+                .height = global_font.height,
+                .padding = 1,
+            });
+            cursor_x += 1;
+        },
+        .backspace => {
+            cursor_x -= 1;
+            const x = cursor_x * (global_font.width + 1);
+            const y = cursor_y * (global_font.height);
+            ozlib.fb.renderBitmap(&global_video_fb, x, y, &empty_glyph, .{
+                .fg = .fromRgb(255, 255, 255),
+                .bg = .fromRgb(0, 0, 0),
+                .width = global_font.width,
+                .height = global_font.height,
+                .padding = 1,
+            });
+        },
+        .enter => {
+            cursor_x = 0;
+            cursor_y += 1;
+        },
+        else => {},
+    }
+    const codepoint = event.code.toAscii() orelse return;
+    const glyph = global_font.getGlyphBitmap(codepoint) orelse return;
+    const x = cursor_x * (global_font.width + 1);
+    const y = cursor_y * (global_font.height);
+    ozlib.fb.renderBitmap(&global_video_fb, x, y, glyph, .{
+        .fg = .fromRgb(255, 255, 255),
+        .bg = .fromRgb(0, 0, 0),
+        .width = global_font.width,
+        .height = global_font.height,
+        .padding = 1,
+    });
+    cursor_x += 1;
 }
 
 fn makeExceptionHandler(comptime selector: int.SegmentSelector, comptime name: []const u8, comptime vector: u8, comptime gate_type: int.GateType) int.InterruptDescriptor {
