@@ -1,0 +1,125 @@
+a	1C	F0,1C
+b	32	F0,32
+c	21	F0,21
+d	23	F0,23
+e	24	F0,24
+f	2B	F0,2B
+g	34	F0,34
+h	33	F0,33
+i	43	F0,43
+j	3B	F0,3B
+k	42	F0,42
+l	4B	F0,4B
+m	3A	F0,3A
+n	31	F0,31
+o	44	F0,44
+p	4D	F0,4D
+q	15	F0,15
+r	2D	F0,2D
+s	1B	F0,1B
+t	2C	F0,2C
+u	3C	F0,3C
+v	2A	F0,2A
+w	1D	F0,1D
+x	22	F0,22
+y	35	F0,35
+z	1A	F0,1A
+num_0	45	F0,45
+num_1	16	F0,16
+num_2	1E	F0,1E
+num_3	26	F0,26
+num_4	25	F0,25
+num_5	2E	F0,2E
+num_6	36	F0,36
+dot	49	F0,49
+num_7	3D	F0,3D
+num_8	3E	F0,3E
+slash	4A	F0,4A
+scroll_lock	7E	F0,7E
+num_9	46	F0,46
+l_square	54	FO,54
+backtick	0E	F0,0E
+dash	4E	F0,4E
+equals	55	FO,55
+backslash	5D	F0,5D
+bksp	66	F0,66
+space	29	F0,29
+tab	0D	F0,0D
+caps_lock	58	F0,58
+l_shft	12	FO,12
+l_ctrl	14	FO,14
+num_lock	77	F0,77
+l_alt	11	F0,11
+r_shft	59	F0,59
+kp_asterisk	7C	F0,7C
+kp_dash	7B	F0,7B
+kp_plus	79	F0,79
+kp_dot	71	F0,71
+enter	5A	F0,5A
+kp_0	70	F0,70
+esc	76	F0,76
+kp_1	69	F0,69
+f1	05	F0,05
+kp_2	72	F0,72
+f2	06	F0,06
+kp_3	7A	F0,7A
+f3	04	F0,04
+kp_4	6B	F0,6B
+f4	0C	F0,0C
+kp_5	73	F0,73
+f5	03	F0,03
+kp_6	74	F0,74
+f6	0B	F0,0B
+kp_7	6C	F0,6C
+f7	83	F0,83
+kp_8	75	F0,75
+f8	0A	F0,0A
+kp_9	7D	F0,7D
+f9	01	F0,01
+r_square	5B	F0,5B
+f10	09	F0,09
+semicolon	4C	F0,4C
+f11	78	F0,78
+apostrophe	52	F0,52
+f12	07	F0,07
+comma	41	F0,41
+insert	E0,70	E0,F0,70
+home	E0,6C	E0,F0,6C
+pg_up	E0,7D	E0,F0,7D
+delete	E0,71	E0,F0,71
+end	E0,69	E0,F0,69
+pg_down	E0,7A	E0,F0,7A
+u_arrow	E0,75	E0,F0,75
+l_arrow	E0,6B	E0,F0,6B
+d_arrow	E0,72	E0,F0,72
+r_arrow	E0,74	E0,F0,74
+l_gui	E0,1F	E0,F0,1F
+kp_slash	E0,4A	E0,F0,4A
+r_ctrl	E0,14	E0,F0,14
+r_gui	E0,27	E0,F0,27
+r_alt	E0,11	E0,F0,11
+kp_en	E0,5A	E0,F0,5A
+apps	E0,2F	E0,F0,2F
+power E0,37
+sleep E0,3F
+wake E0,5E
+next_track E0,4D
+previous_track E0,15
+stop E0,3B
+play_pause E0,34
+mute E0,23
+volume_up E0,32
+volume_down E0,21
+media_select E0,50
+email E0,48
+calculator E0,2B
+my_computer E0,40
+www_search E0,10
+www_home E0,3A
+www_back E0,38
+www_forward E0,30
+www_stop E0,28
+www_refresh E0,20
+www_favorites E0,18
+print_screen	E0,12,E0,7C	E0,F0,7C,E0,F0,12
+pause	E1,14,77,E1,F0,14,F0,77	NONE
