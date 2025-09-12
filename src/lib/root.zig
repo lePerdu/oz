@@ -8,6 +8,7 @@ pub const alloc = @import("alloc.zig");
 pub const bootboot = @import("bootboot.zig");
 pub const interrupt = @import("interrupt.zig");
 pub const keyboard = @import("keyboard.zig");
+pub const font = @import("font.zig");
 
 test {
     std.testing.refAllDecls(@This());

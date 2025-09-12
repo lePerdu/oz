@@ -7,6 +7,12 @@ pub const Pixel = extern struct {
     g: u8,
     r: u8,
     _reserved: u8 = undefined,
+
+    const Self = @This();
+
+    pub fn fromRgb(r: u8, g: u8, b: u8) Self {
+        return .{ .b = b, .g = g, .r = r };
+    }
 };
 
 // TODO: Use u32?
@@ -112,4 +118,40 @@ pub fn setupFrameBuffer() !FrameBuffer {
     // }
 
     return FrameBuffer.fromUefiGop(gop_proto);
+}
+
+pub const BitmapConfig = struct {
+    fg: Pixel,
+    bg: Pixel,
+    width: u8,
+    height: u8,
+    padding: u8,
+};
+
+pub fn renderBitmap(fb: *FrameBuffer, x_base: usize, y_base: usize, bitmap: []const u8, config: BitmapConfig) void {
+    const row_byte_len = std.math.divCeil(u8, config.width, 8) catch undefined;
+    std.debug.assert(bitmap.len >= row_byte_len * config.height);
+
+    for (0..config.height) |dy| {
+        const y = y_base + dy;
+        if (y >= fb.height) break;
+        for (0..config.width) |dx| {
+            const x = x_base + dx;
+            if (x >= fb.width) break;
+            // TODO: Shift progressively rather than re-shifting each iteration
+            const byte = bitmap[dy * row_byte_len + dx / 8];
+            const mask = @as(u8, 0x80) >> @truncate(dx % 8);
+            if (byte & mask != 0) {
+                // TODO: Alpha blending?
+                fb.set(x, y, config.fg);
+            } else {
+                fb.set(x, y, config.bg);
+            }
+        }
+        // TODO: Support RTL padding
+        for (0..config.padding) |dx| {
+            const x = x_base + config.width + dx;
+            fb.set(x, y, config.bg);
+        }
+    }
 }
