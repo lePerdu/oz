@@ -22,6 +22,8 @@ const psf1_separator: u16 = 0xFFFF;
 // Some sort of tiered tree structure?
 const UnicodeTable = struct {
     unicode_to_index: [128]u16,
+
+    pub const unmapped = 0xFFFF;
 };
 
 pub const Psf1Font = struct {
@@ -75,11 +77,14 @@ pub const Psf1Font = struct {
 
     pub fn getGlyphBitmap(self: *const Self, codepoint: u21) ?[]const u8 {
         // TODO: Handle unicode sequencies
-        const seq_len = std.unicode.utf16CodepointSequenceLength(codepoint) catch 0;
+        const seq_len = std.unicode.utf16CodepointSequenceLength(codepoint) catch return null;
         if (seq_len != 1) return null;
         var index: usize = codepoint;
         if (self.unicode_table) |uni| {
-            index = uni.unicode_to_index[codepoint];
+            index = uni.unicode_to_index[index];
+            if (index == UnicodeTable.unmapped) {
+                return null;
+            }
         }
         return self.bitmap[index * self.height ..][0..self.height];
     }
@@ -89,8 +94,7 @@ fn buildUnicodeTable(allocator: std.mem.Allocator, table_data: []const u16) !*Un
     var table = try allocator.create(UnicodeTable);
     errdefer allocator.destroy(table);
 
-    // Indicates "unmapped"
-    @memset(&table.unicode_to_index, 0xFFFF);
+    @memset(&table.unicode_to_index, UnicodeTable.unmapped);
 
     var glyph_index: u16 = 0;
     var i: usize = 0;
