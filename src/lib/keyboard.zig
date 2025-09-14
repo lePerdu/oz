@@ -82,6 +82,10 @@ const KeyboardCommand = enum(u8) {
 };
 
 const KeyboardResponse = enum(u8) {
+    // Both err1 and err2 have the same meaning
+    err1 = 0x00,
+    err2 = 0xFF,
+
     self_test_passed = 0xAA,
     echo = 0xEE,
     ack = 0xFA,
@@ -93,7 +97,7 @@ const KeyboardResponse = enum(u8) {
 };
 
 /// Key codes based on rows/columns of 104-key US layout
-pub const KeyCode = enum(u8) {
+pub const ScanCode = enum(u8) {
     // multi-media keys are very un-standard, so just pick an order
     power = make(0, 1), // Start at 1 to leave 0 for ?KeyCode optimization
     sleep,
@@ -281,9 +285,359 @@ pub const KeyCode = enum(u8) {
     }
 };
 
-pub const Event = struct {
-    code: KeyCode,
+pub const ScanEvent = struct {
+    code: ScanCode,
     pressed: bool,
+};
+
+pub const KeySym = enum(u32) {
+    // Controls characters that have unicode equivalents
+    space = ' ',
+    tab = '\t',
+    backspace = '\x08',
+    delete = '\x7F',
+    enter = '\r',
+    esc = '\x1B',
+
+    // TODO: rename?
+    invalid = 0xFFFF_FFFF,
+
+    _control_symbol_start = 0xFFFF_0000,
+
+    up,
+    left,
+    down,
+    right,
+    home,
+    end,
+    insert,
+    page_up,
+    page_down,
+
+    l_shift,
+    r_shift,
+    caps_lock,
+    num_lock,
+    scroll_lock,
+    l_ctrl,
+    r_ctrl,
+    l_alt,
+    r_alt,
+    l_gui,
+    r_gui,
+    menu,
+
+    f1,
+    f2,
+    f3,
+    f4,
+    f5,
+    f6,
+    f7,
+    f8,
+    f9,
+    f10,
+    f11,
+    f12,
+
+    print_screen,
+    pause_break,
+
+    power,
+    sleep,
+    wake,
+
+    stop,
+    previous_track,
+    play_pause,
+    next_track,
+    mute,
+    volume_down,
+    volume_up,
+    mic_mute,
+
+    brightness_down,
+    brightness_up,
+
+    apps,
+    email,
+    calculator,
+    my_computer,
+
+    www_search,
+    www_home,
+    www_stop,
+    www_back,
+    www_forward,
+    www_refresh,
+    www_favorites,
+
+    // Any unicode symbol
+    _,
+
+    pub fn asCodepoint(self: @This()) ?u21 {
+        return std.math.cast(u21, @intFromEnum(self));
+    }
+};
+
+/// map (scan_code, modifiers) -> key_sym
+// TODO: Support more modifiers in a scalable way (use packed modifiers value as an index?)
+pub const Layout = struct {
+    mappings: std.EnumArray(ScanCode, Mapping),
+
+    pub const Mapping = struct {
+        base: KeySym,
+        shift: KeySym,
+        caps_lock: KeySym,
+        caps_lock_unshift: KeySym,
+
+        pub const empty = @This(){ .base = .invalid, .shift = .invalid, .caps_lock = .invalid, .caps_lock_unshift = .invalid };
+
+        pub fn basic(base: KeySym) @This() {
+            return .{ .base = base, .shift = base, .caps_lock = base, .caps_lock_unshift = base };
+        }
+
+        pub fn letter(lower: u21, upper: u21) @This() {
+            return .{ .base = @enumFromInt(lower), .shift = @enumFromInt(upper), .caps_lock = @enumFromInt(upper), .caps_lock_unshift = @enumFromInt(lower) };
+        }
+
+        pub fn symbol(base: u21, shift: u21) @This() {
+            return .{ .base = @enumFromInt(base), .shift = @enumFromInt(shift), .caps_lock = @enumFromInt(base), .caps_lock_unshift = @enumFromInt(shift) };
+        }
+    };
+
+    const Self = @This();
+
+    pub fn init(values: std.enums.EnumFieldStruct(ScanCode, Mapping, Mapping.empty)) Self {
+        return .{ .mappings = std.EnumArray(ScanCode, Mapping).initDefault(.empty, values) };
+    }
+
+    pub fn map(self: *const Self, code: ScanCode, mods: Modifiers) ?KeySym {
+        const mapping = self.mappings.get(code);
+        const optSym = if (mods.caps_lock) (if (mods.shift) mapping.caps_lock_unshift else mapping.caps_lock) else (if (mods.shift) mapping.shift else mapping.base);
+        if (optSym == .invalid) {
+            return null;
+        } else {
+            return optSym;
+        }
+    }
+};
+
+pub const us_layout = Layout.init(.{
+    .backtick = .symbol('`', '~'),
+    .num1 = .symbol('1', '!'),
+    .num2 = .symbol('2', '@'),
+    .num3 = .symbol('3', '#'),
+    .num4 = .symbol('4', '$'),
+    .num5 = .symbol('5', '%'),
+    .num6 = .symbol('6', '^'),
+    .num7 = .symbol('7', '&'),
+    .num8 = .symbol('8', '*'),
+    .num9 = .symbol('9', '('),
+    .num0 = .symbol('0', ')'),
+    .dash = .symbol('-', '_'),
+    .equals = .symbol('=', '+'),
+    .q = .letter('q', 'Q'),
+    .w = .letter('w', 'W'),
+    .e = .letter('e', 'E'),
+    .r = .letter('r', 'R'),
+    .t = .letter('t', 'T'),
+    .y = .letter('y', 'Y'),
+    .u = .letter('u', 'U'),
+    .i = .letter('i', 'I'),
+    .o = .letter('o', 'O'),
+    .p = .letter('p', 'P'),
+    .l_square = .symbol('[', '{'),
+    .r_square = .symbol(']', '}'),
+    .backslash = .symbol('\\', '|'),
+    .a = .letter('a', 'A'),
+    .s = .letter('s', 'S'),
+    .d = .letter('d', 'D'),
+    .f = .letter('f', 'F'),
+    .g = .letter('g', 'G'),
+    .h = .letter('h', 'H'),
+    .j = .letter('j', 'J'),
+    .k = .letter('k', 'K'),
+    .l = .letter('l', 'L'),
+    .semicolon = .symbol(';', ':'),
+    .apostrophe = .symbol('\'', '"'),
+    .z = .letter('z', 'Z'),
+    .x = .letter('x', 'X'),
+    .c = .letter('c', 'C'),
+    .v = .letter('v', 'V'),
+    .b = .letter('b', 'B'),
+    .n = .letter('n', 'N'),
+    .m = .letter('m', 'M'),
+    .comma = .symbol(',', '<'),
+    .dot = .symbol('.', '>'),
+    .slash = .symbol('/', '?'),
+
+    // TODO: Autogenerate thees identity mappings
+
+    .space = .basic(KeySym.space),
+    .tab = .basic(KeySym.tab),
+    .backspace = .basic(KeySym.backspace),
+    .delete = .basic(KeySym.delete),
+    .enter = .basic(KeySym.enter),
+    .esc = .basic(KeySym.esc),
+
+    .up = .basic(KeySym.up),
+    .left = .basic(KeySym.left),
+    .down = .basic(KeySym.down),
+    .right = .basic(KeySym.right),
+    .home = .basic(KeySym.home),
+    .end = .basic(KeySym.end),
+    .insert = .basic(KeySym.insert),
+    .page_up = .basic(KeySym.page_up),
+    .page_down = .basic(KeySym.page_down),
+
+    .l_shift = .basic(KeySym.l_shift),
+    .r_shift = .basic(KeySym.r_shift),
+    .caps_lock = .basic(KeySym.caps_lock),
+    .num_lock = .basic(KeySym.num_lock),
+    .scroll_lock = .basic(KeySym.scroll_lock),
+    .l_ctrl = .basic(KeySym.l_ctrl),
+    .r_ctrl = .basic(KeySym.r_ctrl),
+    .l_alt = .basic(KeySym.l_alt),
+    .r_alt = .basic(KeySym.r_alt),
+    .l_gui = .basic(KeySym.l_gui),
+    .r_gui = .basic(KeySym.r_gui),
+    .menu = .basic(KeySym.menu),
+
+    .f1 = .basic(KeySym.f1),
+    .f2 = .basic(KeySym.f2),
+    .f3 = .basic(KeySym.f3),
+    .f4 = .basic(KeySym.f4),
+    .f5 = .basic(KeySym.f5),
+    .f6 = .basic(KeySym.f6),
+    .f7 = .basic(KeySym.f7),
+    .f8 = .basic(KeySym.f8),
+    .f9 = .basic(KeySym.f9),
+    .f10 = .basic(KeySym.f10),
+    .f11 = .basic(KeySym.f11),
+    .f12 = .basic(KeySym.f12),
+
+    .print_screen = .basic(KeySym.print_screen),
+    .pause_break = .basic(KeySym.pause_break),
+
+    .power = .basic(KeySym.power),
+    .sleep = .basic(KeySym.sleep),
+    .wake = .basic(KeySym.wake),
+
+    .stop = .basic(KeySym.stop),
+    .previous_track = .basic(KeySym.previous_track),
+    .play_pause = .basic(KeySym.play_pause),
+    .next_track = .basic(KeySym.next_track),
+    .mute = .basic(KeySym.mute),
+    .volume_down = .basic(KeySym.volume_down),
+    .volume_up = .basic(KeySym.volume_up),
+    .mic_mute = .basic(KeySym.mic_mute),
+
+    .brightness_down = .basic(KeySym.brightness_down),
+    .brightness_up = .basic(KeySym.brightness_up),
+
+    .apps = .basic(KeySym.apps),
+    .email = .basic(KeySym.email),
+    .calculator = .basic(KeySym.calculator),
+    .my_computer = .basic(KeySym.my_computer),
+
+    .www_search = .basic(KeySym.www_search),
+    .www_home = .basic(KeySym.www_home),
+    .www_stop = .basic(KeySym.www_stop),
+    .www_back = .basic(KeySym.www_back),
+    .www_forward = .basic(KeySym.www_forward),
+    .www_refresh = .basic(KeySym.www_refresh),
+    .www_favorites = .basic(KeySym.www_favorites),
+});
+
+// TODO: Support "layout-defined" modifiers?
+pub const Modifiers = packed struct {
+    shift: bool = false,
+    ctrl: bool = false,
+    alt: bool = false,
+    gui: bool = false,
+    caps_lock: bool = false,
+    num_lock: bool = false,
+    scroll_lock: bool = false,
+};
+
+pub const KeyEvent = struct {
+    sym: KeySym,
+    mods: Modifiers,
+    pressed: bool,
+};
+
+// TODO: Track this in Layout so that it can support more modifiers or more modifier keys (e.g. 4 keys that "shift")
+const ModifiersPressed = packed struct {
+    // Track whether keys are currently pressed
+    l_shift: bool = false,
+    r_shift: bool = false,
+    l_ctrl: bool = false,
+    r_ctrl: bool = false,
+    l_alt: bool = false,
+    r_alt: bool = false,
+    l_gui: bool = false,
+    r_gui: bool = false,
+    // Track whether toggled
+    caps_lock: bool = false,
+    num_lock: bool = false,
+    scroll_lock: bool = false,
+
+    pub fn toModifiers(self: *const @This()) Modifiers {
+        return .{
+            .shift = self.l_shift or self.r_shift,
+            .ctrl = self.l_ctrl or self.r_ctrl,
+            .alt = self.l_alt or self.r_alt,
+            .gui = self.l_gui or self.r_gui,
+            .caps_lock = self.caps_lock,
+            .num_lock = self.num_lock,
+            .scroll_lock = self.scroll_lock,
+        };
+    }
+};
+
+pub const LayoutController = struct {
+    layout: *const Layout,
+    modifier_state: ModifiersPressed = .{},
+
+    const Self = @This();
+
+    // TODO: Allow returning >1 events?
+    pub fn input(self: *Self, event: ScanEvent) ?KeyEvent {
+        const sym = self.layout.map(event.code, self.getModifiers()) orelse return null;
+        // TODO: Still pass on events for these modifiers?
+        switch (sym) {
+            .l_shift => self.modifier_state.l_shift = event.pressed,
+            .r_shift => self.modifier_state.r_shift = event.pressed,
+            .l_ctrl => self.modifier_state.l_ctrl = event.pressed,
+            .r_ctrl => self.modifier_state.r_ctrl = event.pressed,
+            .l_alt => self.modifier_state.l_alt = event.pressed,
+            .r_alt => self.modifier_state.r_alt = event.pressed,
+            .l_gui => self.modifier_state.l_gui = event.pressed,
+            .r_gui => self.modifier_state.r_gui = event.pressed,
+            .caps_lock => {
+                if (event.pressed) {
+                    self.modifier_state.caps_lock = !self.modifier_state.caps_lock;
+                }
+            },
+            .num_lock => {
+                if (event.pressed) {
+                    self.modifier_state.num_lock = !self.modifier_state.num_lock;
+                }
+            },
+            .scroll_lock => {
+                if (event.pressed) {
+                    self.modifier_state.scroll_lock = !self.modifier_state.scroll_lock;
+                }
+            },
+            else => {},
+        }
+        return .{ .sym = sym, .mods = self.modifier_state.toModifiers(), .pressed = event.pressed };
+    }
+
+    pub fn getModifiers(self: *const Self) Modifiers {
+        return self.modifier_state.toModifiers();
+    }
 };
 
 // TODO: Extract this into a data file
@@ -386,15 +740,15 @@ const scan_code_set_2 = struct {
         // TODO: Extract this to share with ExtendedCode
         const to_key_code = init: {
             // Setting to undefined is safe since the indices will only ever be enum values
-            var array: [std.enums.directEnumArrayLen(@This(), 256)]KeyCode = undefined;
+            var array: [std.enums.directEnumArrayLen(@This(), 256)]ScanCode = undefined;
             const info = @typeInfo(Self).@"enum";
             for (info.fields) |field| {
-                array[field.value] = @field(KeyCode, field.name);
+                array[field.value] = @field(ScanCode, field.name);
             }
             break :init array;
         };
 
-        pub fn toKeyCode(self: Self) KeyCode {
+        pub fn toKeyCode(self: Self) ScanCode {
             return to_key_code[@intFromEnum(self)];
         }
     };
@@ -443,15 +797,15 @@ const scan_code_set_2 = struct {
 
         // Generate a mapping table based on enum field names matching those in KeyCode
         const to_key_code = init: {
-            var array: [std.enums.directEnumArrayLen(@This(), 256)]KeyCode = undefined;
+            var array: [std.enums.directEnumArrayLen(@This(), 256)]ScanCode = undefined;
             const info = @typeInfo(Self).@"enum";
             for (info.fields) |field| {
-                array[field.value] = @field(KeyCode, field.name);
+                array[field.value] = @field(ScanCode, field.name);
             }
             break :init array;
         };
 
-        pub fn toKeyCode(self: Self) KeyCode {
+        pub fn toKeyCode(self: Self) ScanCode {
             return to_key_code[@intFromEnum(self)];
         }
     };
@@ -484,7 +838,7 @@ const scan_code_set_2 = struct {
 
         const Self = @This();
 
-        pub fn input(self: *Self, byte: u8) ?Event {
+        pub fn input(self: *Self, byte: u8) ?ScanEvent {
             switch (self.state) {
                 .init => {
                     switch (byte) {
@@ -503,7 +857,7 @@ const scan_code_set_2 = struct {
                         },
                         else => {
                             if (std.enums.fromInt(SimpleCode, byte)) |simple| {
-                                return Event{ .code = simple.toKeyCode(), .pressed = true };
+                                return ScanEvent{ .code = simple.toKeyCode(), .pressed = true };
                             } else {
                                 std.log.warn("unknown scan code: 0x{x:02}", .{byte});
                                 return null;
@@ -517,7 +871,7 @@ const scan_code_set_2 = struct {
                         return null;
                     } else if (std.enums.fromInt(ExtendedCode, byte)) |extended| {
                         self.state = .init;
-                        return Event{ .code = extended.toKeyCode(), .pressed = true };
+                        return ScanEvent{ .code = extended.toKeyCode(), .pressed = true };
                     } else if (byte == print_screen_make[0]) {
                         self.state = .print_screen_make;
                         self.special_index = 1;
@@ -531,7 +885,7 @@ const scan_code_set_2 = struct {
                 .release => {
                     if (std.enums.fromInt(SimpleCode, byte)) |simple| {
                         self.state = .init;
-                        return Event{ .code = simple.toKeyCode(), .pressed = false };
+                        return ScanEvent{ .code = simple.toKeyCode(), .pressed = false };
                     } else {
                         self.state = .init;
                         std.log.warn("unknown release scan code: 0x{x:02}", .{byte});
@@ -541,7 +895,7 @@ const scan_code_set_2 = struct {
                 .release_extended => {
                     if (std.enums.fromInt(ExtendedCode, byte)) |extended| {
                         self.state = .init;
-                        return Event{ .code = extended.toKeyCode(), .pressed = false };
+                        return ScanEvent{ .code = extended.toKeyCode(), .pressed = false };
                     } else if (byte == print_screen_release[0]) {
                         self.state = .print_screen_release;
                         // Already checked the first byte
@@ -559,7 +913,7 @@ const scan_code_set_2 = struct {
                         self.special_index += 1;
                         if (self.special_index == print_screen_make.len) {
                             self.state = .init;
-                            return Event{ .code = .print_screen, .pressed = true };
+                            return ScanEvent{ .code = .print_screen, .pressed = true };
                         } else {
                             return null;
                         }
@@ -574,7 +928,7 @@ const scan_code_set_2 = struct {
                         self.special_index += 1;
                         if (self.special_index == print_screen_release.len) {
                             self.state = .init;
-                            return Event{ .code = .print_screen, .pressed = false };
+                            return ScanEvent{ .code = .print_screen, .pressed = false };
                         } else {
                             return null;
                         }
@@ -591,7 +945,7 @@ const scan_code_set_2 = struct {
                             // release always has to come afterwards for this key
                             self.state = .pause_break_release;
                             self.special_index = 0;
-                            return Event{ .code = .pause_break, .pressed = true };
+                            return ScanEvent{ .code = .pause_break, .pressed = true };
                         } else {
                             return null;
                         }
@@ -606,7 +960,7 @@ const scan_code_set_2 = struct {
                         self.special_index += 1;
                         if (self.special_index == pause_break_release.len) {
                             self.state = .init;
-                            return Event{ .code = .pause_break, .pressed = false };
+                            return ScanEvent{ .code = .pause_break, .pressed = false };
                         } else {
                             return null;
                         }
@@ -624,30 +978,30 @@ const scan_code_set_2 = struct {
 
     test "StateMachine: simple press/release" {
         var sm = StateMachine{};
-        try testing.expectEqual(Event{ .code = .k, .pressed = true }, sm.input(0x42));
+        try testing.expectEqual(ScanEvent{ .code = .k, .pressed = true }, sm.input(0x42));
         try testing.expectEqual(.init, sm.state);
         try testing.expectEqual(null, sm.input(0xF0));
-        try testing.expectEqual(Event{ .code = .k, .pressed = false }, sm.input(0x42));
+        try testing.expectEqual(ScanEvent{ .code = .k, .pressed = false }, sm.input(0x42));
         try testing.expectEqual(.init, sm.state);
     }
 
     test "StateMachine: simple press/repeat" {
         var sm = StateMachine{};
-        try testing.expectEqual(Event{ .code = .k, .pressed = true }, sm.input(0x42));
-        try testing.expectEqual(Event{ .code = .k, .pressed = true }, sm.input(0x42));
-        try testing.expectEqual(Event{ .code = .k, .pressed = true }, sm.input(0x42));
-        try testing.expectEqual(Event{ .code = .k, .pressed = true }, sm.input(0x42));
+        try testing.expectEqual(ScanEvent{ .code = .k, .pressed = true }, sm.input(0x42));
+        try testing.expectEqual(ScanEvent{ .code = .k, .pressed = true }, sm.input(0x42));
+        try testing.expectEqual(ScanEvent{ .code = .k, .pressed = true }, sm.input(0x42));
+        try testing.expectEqual(ScanEvent{ .code = .k, .pressed = true }, sm.input(0x42));
         try testing.expectEqual(.init, sm.state);
     }
 
     test "StateMachine: extended press/release" {
         var sm = StateMachine{};
         try testing.expectEqual(null, sm.input(0xE0));
-        try testing.expectEqual(Event{ .code = .left, .pressed = true }, sm.input(0x6B));
+        try testing.expectEqual(ScanEvent{ .code = .left, .pressed = true }, sm.input(0x6B));
         try testing.expectEqual(.init, sm.state);
         try testing.expectEqual(null, sm.input(0xE0));
         try testing.expectEqual(null, sm.input(0xF0));
-        try testing.expectEqual(Event{ .code = .left, .pressed = false }, sm.input(0x6B));
+        try testing.expectEqual(ScanEvent{ .code = .left, .pressed = false }, sm.input(0x6B));
         try testing.expectEqual(.init, sm.state);
     }
 
@@ -656,14 +1010,14 @@ const scan_code_set_2 = struct {
         try testing.expectEqual(null, sm.input(0xE0));
         try testing.expectEqual(null, sm.input(0x12));
         try testing.expectEqual(null, sm.input(0xE0));
-        try testing.expectEqual(Event{ .code = .print_screen, .pressed = true }, sm.input(0x7C));
+        try testing.expectEqual(ScanEvent{ .code = .print_screen, .pressed = true }, sm.input(0x7C));
         try testing.expectEqual(.init, sm.state);
         try testing.expectEqual(null, sm.input(0xE0));
         try testing.expectEqual(null, sm.input(0xF0));
         try testing.expectEqual(null, sm.input(0x7C));
         try testing.expectEqual(null, sm.input(0xE0));
         try testing.expectEqual(null, sm.input(0xF0));
-        try testing.expectEqual(Event{ .code = .print_screen, .pressed = false }, sm.input(0x12));
+        try testing.expectEqual(ScanEvent{ .code = .print_screen, .pressed = false }, sm.input(0x12));
         try testing.expectEqual(.init, sm.state);
     }
 
@@ -671,14 +1025,14 @@ const scan_code_set_2 = struct {
         var sm = StateMachine{};
         try testing.expectEqual(null, sm.input(0xE1));
         try testing.expectEqual(null, sm.input(0x14));
-        try testing.expectEqual(Event{ .code = .pause_break, .pressed = true }, sm.input(0x77));
+        try testing.expectEqual(ScanEvent{ .code = .pause_break, .pressed = true }, sm.input(0x77));
         // Can't send another key here
         try testing.expect(sm.state != .init);
         try testing.expectEqual(null, sm.input(0xE1));
         try testing.expectEqual(null, sm.input(0xF0));
         try testing.expectEqual(null, sm.input(0x14));
         try testing.expectEqual(null, sm.input(0xF0));
-        try testing.expectEqual(Event{ .code = .pause_break, .pressed = false }, sm.input(0x77));
+        try testing.expectEqual(ScanEvent{ .code = .pause_break, .pressed = false }, sm.input(0x77));
         try testing.expectEqual(.init, sm.state);
     }
 
@@ -844,7 +1198,7 @@ pub const Controller = struct {
 
     const Self = @This();
 
-    pub fn handleInterrupt(self: *Self) ?Event {
+    pub fn handleInterrupt(self: *Self) ?ScanEvent {
         defer pic.sendMasterEoi();
         return self.scan_code_sm.input(readData());
     }

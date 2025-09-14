@@ -130,29 +130,6 @@ export fn main() callconv(.{
     //     },
     // }
 
-    const glyph = [_]u8{
-        0b00000110, 0b00000000,
-        0b00001111, 0b00000000,
-        0b00011001, 0b10000000,
-        0b00110000, 0b11000000,
-        0b01100000, 0b01100000,
-        0b11000000, 0b00110000,
-        0b11111111, 0b11110000,
-        0b11111111, 0b11110000,
-        0b11000000, 0b00110000,
-        0b11000000, 0b00110000,
-        0b11000000, 0b00110000,
-        0b11000000, 0b00110000,
-    };
-
-    ozlib.fb.renderBitmap(&global_video_fb, 100, 100, &glyph, .{
-        .fg = .fromRgb(255, 255, 255),
-        .bg = .fromRgb(0, 0, 0),
-        .width = 12,
-        .height = 12,
-        .padding = 1,
-    });
-
     std.log.info("done", .{});
     kdebug.halt();
 }
@@ -372,11 +349,15 @@ fn int32Handler() callconv(.{ .x86_64_interrupt = .{} }) void {
 var cursor_x: usize = 0;
 var cursor_y: usize = 0;
 const empty_glyph = std.mem.zeroes([64]u8);
+var layout_controller = keyboard.LayoutController{ .layout = &keyboard.us_layout };
 
 fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
-    const event = global_keyboard_controller.handleInterrupt() orelse return;
+    const raw_event = global_keyboard_controller.handleInterrupt() orelse return;
+    std.log.debug("raw event={}", .{raw_event});
+    const event = layout_controller.input(raw_event) orelse return;
+    std.log.debug("mapped event={}", .{event});
     if (!event.pressed) return;
-    switch (event.code) {
+    switch (event.sym) {
         .up => {
             if (cursor_y > 0) cursor_y -= 1;
             return;
@@ -421,20 +402,21 @@ fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
             cursor_x = 0;
             cursor_y += 1;
         },
-        else => {},
+        else => {
+            const codepoint = event.sym.asCodepoint() orelse return;
+            const glyph = global_font.getGlyphBitmap(codepoint) orelse return;
+            const x = cursor_x * (global_font.width + 1);
+            const y = cursor_y * (global_font.height);
+            ozlib.fb.renderBitmap(&global_video_fb, x, y, glyph, .{
+                .fg = .fromRgb(255, 255, 255),
+                .bg = .fromRgb(0, 0, 0),
+                .width = global_font.width,
+                .height = global_font.height,
+                .padding = 1,
+            });
+            cursor_x += 1;
+        },
     }
-    const codepoint = event.code.toAscii() orelse return;
-    const glyph = global_font.getGlyphBitmap(codepoint) orelse return;
-    const x = cursor_x * (global_font.width + 1);
-    const y = cursor_y * (global_font.height);
-    ozlib.fb.renderBitmap(&global_video_fb, x, y, glyph, .{
-        .fg = .fromRgb(255, 255, 255),
-        .bg = .fromRgb(0, 0, 0),
-        .width = global_font.width,
-        .height = global_font.height,
-        .padding = 1,
-    });
-    cursor_x += 1;
 }
 
 fn makeExceptionHandler(comptime selector: int.SegmentSelector, comptime name: []const u8, comptime vector: u8, comptime gate_type: int.GateType) int.InterruptDescriptor {
