@@ -533,7 +533,7 @@ fn parseMemMap(
 
 fn getBspid() u16 {
     var cpuid_ebx: u32 = undefined;
-    asm volatile (
+    asm (
         \\mov $1, %%eax
         \\cpuid
         : [bspid] "={ebx}" (cpuid_ebx),
@@ -558,6 +558,37 @@ fn initBootboot(fb: *uefi.protocol.GraphicsOutput) !*ozlib.bootboot.Bootboot {
         // TODO: Parse this in case it's one of the valid types
         .bit_mask => .none,
         .blt_only => .none,
+    };
+
+    const conf_tables = uefi.system_table.configuration_table[0..uefi.system_table.number_of_table_entries];
+
+    // TODO: Is falling back to v1. acceptable?
+    const acpi_ptr = found: {
+        for (conf_tables) |t| {
+            if (t.vendor_guid.eql(uefi.tables.ConfigurationTable.acpi_20_table_guid)) {
+                break :found t.vendor_table;
+            }
+        }
+        break :found null;
+    };
+
+    // TODO: Should this be 32-bit or 64-bit version?
+    const smbios_ptr = found: {
+        for (conf_tables) |t| {
+            if (t.vendor_guid.eql(uefi.tables.ConfigurationTable.smbios3_table_guid)) {
+                break :found t.vendor_table;
+            }
+        }
+        break :found null;
+    };
+
+    const mps_ptr = found: {
+        for (conf_tables) |t| {
+            if (t.vendor_guid.eql(uefi.tables.ConfigurationTable.mps_table_guid)) {
+                break :found t.vendor_table;
+            }
+        }
+        break :found null;
     };
 
     ptr.* = .{
@@ -589,10 +620,9 @@ fn initBootboot(fb: *uefi.protocol.GraphicsOutput) !*ozlib.bootboot.Bootboot {
         .platform = .{
             .x64_64 = .{
                 .efi_ptr = @intFromPtr(uefi.system_table),
-                // TODO: Fetch this info
-                .acpi_ptr = 0,
-                .mp_ptr = 0,
-                .smbi_ptr = 0,
+                .acpi_ptr = @intFromPtr(acpi_ptr),
+                .mp_ptr = @intFromPtr(mps_ptr),
+                .smbi_ptr = @intFromPtr(smbios_ptr),
             },
         },
 
