@@ -466,7 +466,7 @@ fn queryMemMap() !uefi.tables.MemoryMapSlice {
 
 fn memDescContains(desc: *uefi.tables.MemoryDescriptor, ptr: ?*anyopaque) bool {
     const addr: paging.PhysicalAddress = @intFromPtr(ptr);
-    return desc.physical_start <= addr and desc.physical_start + desc.number_of_pages * 4096 < addr;
+    return desc.physical_start <= addr and addr < desc.physical_start + desc.number_of_pages * 4096;
 }
 
 fn getMemEntType(desc: *uefi.tables.MemoryDescriptor) ozlib.bootboot.MMapType {
