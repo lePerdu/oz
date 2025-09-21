@@ -17,13 +17,21 @@ pub const Pixel = extern struct {
 
 // TODO: Use u32?
 pub const Coord = struct {
-    x: usize = 0,
-    y: usize = 0,
+    x: usize,
+    y: usize,
+
+    pub const zero = @This(){ .x = 0, .y = 0 };
 };
 
 pub const Rect = struct {
-    base: Coord = .{},
+    base: Coord,
     size: Coord,
+
+    pub const empty = @This(){ .base = .zero, .size = .zero };
+
+    pub fn fromSize(width: usize, height: usize) @This() {
+        return .{ .base = .zero, .size = .{ .x = width, .y = height } };
+    }
 };
 
 /// Frame buffer from `EFI_GRAPHICS_OUTPUT_PROTOCOL`, but with a custom
@@ -54,8 +62,13 @@ pub const FrameBuffer = struct {
         };
     }
 
-    pub fn size(self: *const Self) u32 {
+    pub fn sizePixels(self: *const Self) u32 {
+        // TODO: Upcast to usize?
         return self.height * self.pixels_per_row;
+    }
+
+    pub fn sizeBytes(self: *const Self) u32 {
+        return self.sizePixels() * @sizeOf(Pixel);
     }
 
     fn index(self: *const Self, x: usize, y: usize) usize {

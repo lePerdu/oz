@@ -105,7 +105,11 @@ export fn main() callconv(.{
     asm volatile ("int $0x32" ::: .{ .memory = true });
 
     int.pic.configure();
-    keyboard.configure();
+    keyboard.configure() catch |err| {
+        std.log.err("failed to configure keyboard: {}", .{err});
+        // TODO: Continue on without keyboard?
+        kdebug.halt();
+    };
     int.pic.setEnabled(.{ .keyboard = true });
 
     global_video_fb = ozlib.FrameBuffer{
@@ -115,11 +119,11 @@ export fn main() callconv(.{
         .pixels_per_row = bootboot.fb_scanline,
     };
     std.log.info("Frame buffer: width={} height={}", .{ global_video_fb.width, global_video_fb.height });
-    renderGradient(&global_video_fb, 0, 0);
+    global_video_fb.fill(.fromRgb(0, 0, 0), .fromSize(global_video_fb.width, global_video_fb.height));
     // var x_offset: i32 = 0;
     // const y_offset: i32 = 0;
     // while (true) {
-    //     renderGradient(&video_fb, x_offset, y_offset);
+    //     renderGradient(&global_video_fb, x_offset, y_offset);
     //     x_offset +%= 1;
     // }
 
@@ -360,19 +364,15 @@ fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
     switch (event.sym) {
         .up => {
             if (cursor_y > 0) cursor_y -= 1;
-            return;
         },
         .left => {
             if (cursor_x > 0) cursor_x -= 1;
-            return;
         },
         .down => {
             cursor_y += 1;
-            return;
         },
         .right => {
             cursor_x += 1;
-            return;
         },
         .space => {
             const x = cursor_x * (global_font.width + 1);
@@ -387,6 +387,7 @@ fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
             cursor_x += 1;
         },
         .backspace => {
+            if (cursor_x == 0) return;
             cursor_x -= 1;
             const x = cursor_x * (global_font.width + 1);
             const y = cursor_y * (global_font.height);

@@ -30,7 +30,7 @@ const PS2Command = enum(u8) {
     enable_port_2 = 0xA8,
     test_port_2 = 0xA9,
 
-    test_controller = 0xAA,
+    self_test = 0xAA,
 
     test_port_1 = 0xAB,
     diagnostic_dump = 0xAC,
@@ -45,6 +45,21 @@ const PS2Command = enum(u8) {
     write_port_1_output = 0xD2,
     write_port_2_output = 0xD3,
     write_port_2_input = 0xD4,
+
+    pub const SelfTestResponse = enum(u8) {
+        passed = 0x55,
+        failed = 0xFC,
+        _,
+    };
+
+    pub const TestPortResponse = enum(u8) {
+        passed = 0x00,
+        clock_line_stuck_low = 0x01,
+        clock_line_stuck_high = 0x02,
+        data_line_stuck_low = 0x03,
+        data_line_stuck_high = 0x04,
+        _,
+    };
 };
 
 const PS2Config = packed struct(u8) {
@@ -1101,8 +1116,27 @@ fn writeData(data: u8) void {
     port_io.outbComptimePort(DATA_PORT, data);
 }
 
-fn writeKeyboardCommand(cmd: KeyboardCommand) void {
-    waitWriteData(@intFromEnum(cmd));
+/// Write a keyboard command and wait for ACK.
+/// Resends a few times before failing.
+fn writeKeyboardCommand(cmd: KeyboardCommand, args: anytype) !KeyboardResponse {
+    while (true) {
+        try waitWriteData(@intFromEnum(cmd));
+        inline for (args) |arg| {
+            try waitWriteData(arg);
+        }
+
+        const res: KeyboardResponse = @enumFromInt(try waitReadData());
+        if (res == .resend) {
+            continue;
+        } else {
+            return res;
+        }
+    }
+}
+
+fn writeKeyboardCommandWithAck(cmd: KeyboardCommand, args: anytype) !void {
+    const res = try writeKeyboardCommand(cmd, args);
+    if (res != .ack) return error.ExpectedAck;
 }
 
 fn readStatus() PS2Status {
@@ -1113,12 +1147,12 @@ fn writeCommand(cmd: PS2Command) void {
     port_io.outbComptimePort(COMMAND_PORT, @intFromEnum(cmd));
 }
 
-fn waitReadData() u8 {
+fn waitReadData() error{ReadTimeout}!u8 {
     while (!readStatus().output_buffer_full) {}
     return readData();
 }
 
-fn waitWriteData(data: u8) void {
+fn waitWriteData(data: u8) error{WriteTimeout}!void {
     while (readStatus().input_buffer_full) {}
     writeData(data);
 }
@@ -1126,7 +1160,7 @@ fn waitWriteData(data: u8) void {
 /// Configure the PS/2 controller
 ///
 /// https://wiki.osdev.org/I8042_PS/2_Controller#Initialising_the_PS/2_Controller
-pub fn configure() void {
+pub fn configure() !void {
 
     // Disable
     writeCommand(.disable_port_1);
@@ -1141,54 +1175,69 @@ pub fn configure() void {
     // - Port 1 clock enabled, but interrupts and translation disabled
     // - Port 2 fully disabled
     writeCommand(.read_config);
-    var config: PS2Config = @bitCast(waitReadData());
+    var config: PS2Config = @bitCast(try waitReadData());
     config.port_1_clock_disable = false;
     config.port_1_int_enable = false;
     config.port_1_translation = false;
     config.port_2_clock_disable = false;
     config.port_2_int_enable = false;
     writeCommand(.write_config);
-    waitWriteData(@bitCast(config));
+    try waitWriteData(@bitCast(config));
 
-    writeCommand(.test_controller);
-    const controller_test_res = waitReadData();
-    std.log.info("PS/2 controller self test: 0x{x}", .{controller_test_res});
+    writeCommand(.self_test);
+    const controller_test_res = try waitReadData();
+    switch (@as(PS2Command.SelfTestResponse, @enumFromInt(controller_test_res))) {
+        .passed => {
+            std.log.debug("PS/2 controller self test: passed", .{});
+        },
+        .failed => {
+            std.log.debug("PS/2 controller self test: failed", .{});
+            return error.SelfTestFailed;
+        },
+        else => {
+            std.log.err("PS/2 controller self test: invalid: {}", .{controller_test_res});
+            return error.SelfTestFailed;
+        },
+    }
 
     // Reset config after self test in case it was reset
     writeCommand(.write_config);
-    waitWriteData(@bitCast(config));
+    try waitWriteData(@bitCast(config));
 
     // TODO: Determine if both ports are available
 
     writeCommand(.test_port_1);
-    const port1_test = waitReadData();
-    std.log.info("PS/2 controller port1 test: 0x{x}", .{port1_test});
+    const port1_test = try waitReadData();
+    switch (@as(PS2Command.TestPortResponse, @enumFromInt(port1_test))) {
+        .passed => {
+            std.log.debug("PS/2 port 1 test: passed", .{});
+        },
+        .clock_line_stuck_low, .clock_line_stuck_high, .data_line_stuck_low, .data_line_stuck_high => |res| {
+            std.log.debug("PS/2 port 1 test: failed: {}", .{res});
+            return error.SelfTestFailed;
+        },
+        else => {
+            std.log.err("PS/2 port 1 test: invalid: {}", .{port1_test});
+            return error.SelfTestFailed;
+        },
+    }
 
     writeCommand(.enable_port_1);
-    writeKeyboardCommand(.reset);
-    {
-        const kbd_ack = waitReadData();
-        const reset_res = waitReadData();
-        std.log.info("reset res: 0x{x} 0x{x}", .{ kbd_ack, reset_res });
+
+    try writeKeyboardCommandWithAck(.reset, .{});
+    const keyboard_self_test_res = try waitReadData();
+    if (keyboard_self_test_res != @intFromEnum(KeyboardResponse.self_test_passed)) {
+        std.log.err("keyboard self test failed: {}", .{keyboard_self_test_res});
+        return error.SelfTestFailed;
     }
 
     // TODO: Detect device type before configuring
-    writeKeyboardCommand(.scan_code_sets);
-    waitWriteData(2);
-    {
-        const scan_code_set_res = waitReadData();
-        std.log.info("scan code set res: 0x{x}", .{scan_code_set_res});
-    }
-
-    writeKeyboardCommand(.enable_scanning);
-    {
-        const enable_scan_res = waitReadData();
-        std.log.info("enable scan res: 0x{x}", .{enable_scan_res});
-    }
+    try writeKeyboardCommandWithAck(.scan_code_sets, .{2});
+    try writeKeyboardCommandWithAck(.enable_scanning, .{});
 
     config.port_1_int_enable = true;
     writeCommand(.write_config);
-    waitWriteData(@bitCast(config));
+    try waitWriteData(@bitCast(config));
 }
 
 pub const Controller = struct {
