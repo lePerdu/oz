@@ -7,7 +7,7 @@ pub const paging = @import("paging.zig");
 pub const alloc = @import("alloc.zig");
 pub const bootboot = @import("bootboot.zig");
 pub const interrupt = @import("interrupt.zig");
-pub const keyboard = @import("keyboard.zig");
+pub const ps2 = @import("ps2/root.zig");
 pub const font = @import("font.zig");
 
 test {

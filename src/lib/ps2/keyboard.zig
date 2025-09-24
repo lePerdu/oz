@@ -1,77 +1,7 @@
 const std = @import("std");
-const int = @import("interrupt.zig");
-const port_io = @import("port_io.zig");
-const pic = @import("interrupt.zig").pic;
+const ps2 = @import("./controller.zig");
 
-pub const IRQ: u8 = 1;
-
-const DATA_PORT = 0x60;
-const COMMAND_PORT = 0x64;
-
-const PS2Status = packed struct(u8) {
-    output_buffer_full: bool,
-    input_buffer_full: bool,
-    system_flag: bool,
-    // Whether data in input buffer is for the device or controller
-    controller_command: bool,
-    _unknown0: u1,
-    _unknown1: u1,
-    timeout_error: bool,
-    parity_error: bool,
-};
-
-const PS2Command = enum(u8) {
-    read_config = 0x20,
-    read_byte_n = 0x21,
-    write_config = 0x60,
-    write_byte_n = 0x61,
-
-    disable_port_2 = 0xA7,
-    enable_port_2 = 0xA8,
-    test_port_2 = 0xA9,
-
-    self_test = 0xAA,
-
-    test_port_1 = 0xAB,
-    diagnostic_dump = 0xAC,
-    disable_port_1 = 0xAD,
-    enable_port_1 = 0xAE,
-
-    read_input = 0xC0,
-    copy_bits_03_to_status_47 = 0xC1,
-    copy_bits_47_to_status_47 = 0xC2,
-    read_output = 0xD0,
-    write_output = 0xD1,
-    write_port_1_output = 0xD2,
-    write_port_2_output = 0xD3,
-    write_port_2_input = 0xD4,
-
-    pub const SelfTestResponse = enum(u8) {
-        passed = 0x55,
-        failed = 0xFC,
-        _,
-    };
-
-    pub const TestPortResponse = enum(u8) {
-        passed = 0x00,
-        clock_line_stuck_low = 0x01,
-        clock_line_stuck_high = 0x02,
-        data_line_stuck_low = 0x03,
-        data_line_stuck_high = 0x04,
-        _,
-    };
-};
-
-const PS2Config = packed struct(u8) {
-    port_1_int_enable: bool,
-    port_2_int_enable: bool,
-    system_flag: bool,
-    _reserved_0: u1,
-    port_1_clock_disable: bool,
-    port_2_clock_disable: bool,
-    port_1_translation: bool,
-    _reserved_1: u1,
-};
+pub const IRQ = ps2.PORT1_IRQ;
 
 const KeyboardCommand = enum(u8) {
     set_leds = 0xED,
@@ -1105,139 +1035,18 @@ const LedStates = packed struct(u8) {
     _reserved: u5 = 0,
 };
 
-const out = port_io.outbComptimePort;
-const in = port_io.inbComptimePort;
-
-pub fn readData() u8 {
-    return port_io.inbComptimePort(DATA_PORT);
-}
-
-fn writeData(data: u8) void {
-    port_io.outbComptimePort(DATA_PORT, data);
-}
-
-/// Write a keyboard command and wait for ACK.
-/// Resends a few times before failing.
-fn writeKeyboardCommand(cmd: KeyboardCommand, args: anytype) !KeyboardResponse {
-    while (true) {
-        try waitWriteData(@intFromEnum(cmd));
-        inline for (args) |arg| {
-            try waitWriteData(arg);
-        }
-
-        const res: KeyboardResponse = @enumFromInt(try waitReadData());
-        if (res == .resend) {
-            continue;
-        } else {
-            return res;
-        }
-    }
-}
-
-fn writeKeyboardCommandWithAck(cmd: KeyboardCommand, args: anytype) !void {
-    const res = try writeKeyboardCommand(cmd, args);
-    if (res != .ack) return error.ExpectedAck;
-}
-
-fn readStatus() PS2Status {
-    return @bitCast(port_io.inbComptimePort(COMMAND_PORT));
-}
-
-fn writeCommand(cmd: PS2Command) void {
-    port_io.outbComptimePort(COMMAND_PORT, @intFromEnum(cmd));
-}
-
-fn waitReadData() error{ReadTimeout}!u8 {
-    while (!readStatus().output_buffer_full) {}
-    return readData();
-}
-
-fn waitWriteData(data: u8) error{WriteTimeout}!void {
-    while (readStatus().input_buffer_full) {}
-    writeData(data);
-}
-
-/// Configure the PS/2 controller
-///
-/// https://wiki.osdev.org/I8042_PS/2_Controller#Initialising_the_PS/2_Controller
 pub fn configure() !void {
+    try ps2.port1WriteDeviceCommandWithAck(KeyboardCommand.scan_code_sets, .{2});
+}
 
-    // Disable
-    writeCommand(.disable_port_1);
-    writeCommand(.disable_port_2);
-
-    // Flush input buffer
-    while (readStatus().input_buffer_full) {
-        _ = readData();
-    }
-
-    // Update config:
-    // - Port 1 clock enabled, but interrupts and translation disabled
-    // - Port 2 fully disabled
-    writeCommand(.read_config);
-    var config: PS2Config = @bitCast(try waitReadData());
-    config.port_1_clock_disable = false;
-    config.port_1_int_enable = false;
-    config.port_1_translation = false;
-    config.port_2_clock_disable = false;
-    config.port_2_int_enable = false;
-    writeCommand(.write_config);
-    try waitWriteData(@bitCast(config));
-
-    writeCommand(.self_test);
-    const controller_test_res = try waitReadData();
-    switch (@as(PS2Command.SelfTestResponse, @enumFromInt(controller_test_res))) {
-        .passed => {
-            std.log.debug("PS/2 controller self test: passed", .{});
-        },
-        .failed => {
-            std.log.debug("PS/2 controller self test: failed", .{});
-            return error.SelfTestFailed;
-        },
-        else => {
-            std.log.err("PS/2 controller self test: invalid: {}", .{controller_test_res});
-            return error.SelfTestFailed;
-        },
-    }
-
-    // Reset config after self test in case it was reset
-    writeCommand(.write_config);
-    try waitWriteData(@bitCast(config));
-
-    // TODO: Determine if both ports are available
-
-    writeCommand(.test_port_1);
-    const port1_test = try waitReadData();
-    switch (@as(PS2Command.TestPortResponse, @enumFromInt(port1_test))) {
-        .passed => {
-            std.log.debug("PS/2 port 1 test: passed", .{});
-        },
-        .clock_line_stuck_low, .clock_line_stuck_high, .data_line_stuck_low, .data_line_stuck_high => |res| {
-            std.log.debug("PS/2 port 1 test: failed: {}", .{res});
-            return error.SelfTestFailed;
-        },
-        else => {
-            std.log.err("PS/2 port 1 test: invalid: {}", .{port1_test});
-            return error.SelfTestFailed;
-        },
-    }
-
-    writeCommand(.enable_port_1);
-
-    try writeKeyboardCommandWithAck(.reset, .{});
-    const keyboard_self_test_res = try waitReadData();
-    if (keyboard_self_test_res != @intFromEnum(KeyboardResponse.self_test_passed)) {
-        std.log.err("keyboard self test failed: {}", .{keyboard_self_test_res});
-        return error.SelfTestFailed;
-    }
-
-    // TODO: Detect device type before configuring
-    try writeKeyboardCommandWithAck(.scan_code_sets, .{2});
-    try writeKeyboardCommandWithAck(.enable_scanning, .{});
-
+pub fn enable() !void {
+    // TODO: Control interrupt enable somewhere else?
+    ps2.writeCommand(.read_config);
+    var config: ps2.Config = @bitCast(try ps2.waitReadData());
     config.port_1_int_enable = true;
-    writeCommand(.write_config);
-    try waitWriteData(@bitCast(config));
+    ps2.writeCommand(.write_config);
+    try ps2.waitWriteData(@bitCast(config));
+    try ps2.port1WriteDeviceCommandWithAck(KeyboardCommand.enable_scanning, .{});
 }
 
 pub const Controller = struct {
@@ -1248,11 +1057,6 @@ pub const Controller = struct {
     const Self = @This();
 
     pub fn handleInterrupt(self: *Self) ?ScanEvent {
-        defer pic.sendMasterEoi();
-        return self.scan_code_sm.input(readData());
+        return self.scan_code_sm.input(ps2.port1Read());
     }
 };
-
-test {
-    std.testing.refAllDeclsRecursive(@This());
-}

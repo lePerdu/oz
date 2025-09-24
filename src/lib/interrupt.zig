@@ -147,7 +147,7 @@ pub const pic = struct {
         sendMasterEoi();
     }
 
-    pub fn sedndEoi(irq: u4) void {
+    pub fn sendEoi(irq: u4) void {
         if (irq >= 8) {
             sendSlaveEoi();
         }

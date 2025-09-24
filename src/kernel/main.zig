@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const ozlib = @import("ozlib");
 const paging = ozlib.paging;
 const int = ozlib.interrupt;
-const keyboard = ozlib.keyboard;
+const keyboard = ozlib.ps2.keyboard;
 
 const kdebug = @import("./debug.zig");
 
@@ -60,7 +60,7 @@ var kernel_heap_state: struct {
     }
 } = .{};
 
-var global_keyboard_controller = keyboard.Controller{};
+var global_keyboard_controller: keyboard.Controller = undefined;
 var global_font = ozlib.font.Psf1Font.empty;
 const font_data align(2) = @embedFile("assets/Lat15-Terminus16.psf").*;
 
@@ -98,6 +98,23 @@ export fn main() callconv(.{
         kdebug.halt();
     };
 
+    const ps2_port_config = ozlib.ps2.controller.configure() catch |err| {
+        std.log.err("failed to configure PS/2 controller: {}", .{err});
+        kdebug.halt();
+    };
+
+    if (ps2_port_config.port1 == .keyboard) {
+        keyboard.configure() catch |err| {
+            std.log.err("failed to configure PS/2 keyboard: {}", .{err});
+        };
+    } else {
+        std.log.warn("PS/2 keyboard not found on port 1", .{});
+    }
+
+    keyboard.enable() catch |err| {
+        std.log.err("failed to enable keyboard: {}", .{err});
+    };
+
     setupInterrupts() catch |err| {
         std.log.err("failed to setup GDT and IDT: {}", .{err});
         kdebug.halt();
@@ -105,11 +122,7 @@ export fn main() callconv(.{
     asm volatile ("int $0x32" ::: .{ .memory = true });
 
     int.pic.configure();
-    keyboard.configure() catch |err| {
-        std.log.err("failed to configure keyboard: {}", .{err});
-        // TODO: Continue on without keyboard?
-        kdebug.halt();
-    };
+    // int.pic.setMask(0xFFFF);
     int.pic.setEnabled(.{ .keyboard = true });
 
     global_video_fb = ozlib.FrameBuffer{
@@ -356,6 +369,7 @@ const empty_glyph = std.mem.zeroes([64]u8);
 var layout_controller = keyboard.LayoutController{ .layout = &keyboard.us_layout };
 
 fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+    defer int.pic.sendMasterEoi();
     const raw_event = global_keyboard_controller.handleInterrupt() orelse return;
     std.log.debug("raw event={}", .{raw_event});
     const event = layout_controller.input(raw_event) orelse return;
@@ -447,7 +461,7 @@ fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vecto
         fn handler(frame: *int.InterruptFrame) callconv(.{ .x86_64_interrupt = .{} }) void {
             _ = frame;
             std.log.info("int v=0x{x:02}: IRQ{}", .{ vector, irq });
-            int.pic.sedndEoi(irq);
+            int.pic.sendEoi(irq);
         }
     };
     return int.InterruptDescriptor.init(@intFromPtr(&S.handler), selector, 0, .int, 0);
