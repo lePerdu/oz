@@ -7,6 +7,7 @@ const ozlib = @import("ozlib");
 const paging = ozlib.paging;
 const int = ozlib.interrupt;
 const keyboard = ozlib.ps2.keyboard;
+const mouse = ozlib.ps2.mouse;
 
 const kdebug = @import("./debug.zig");
 
@@ -60,7 +61,8 @@ var kernel_heap_state: struct {
     }
 } = .{};
 
-var global_keyboard_controller: keyboard.Controller = undefined;
+var global_keyboard_controller = keyboard.Controller{};
+var global_mouse_controller = mouse.Controller{};
 var global_font = ozlib.font.Psf1Font.empty;
 const font_data align(2) = @embedFile("assets/Lat15-Terminus16.psf").*;
 
@@ -111,10 +113,23 @@ export fn main() callconv(.{
         std.log.warn("PS/2 keyboard not found on port 1", .{});
     }
 
+    if (ps2_port_config.port2 == .mouse) {
+        global_mouse_controller = mouse.Controller.configure() catch |err| mouse: {
+            std.log.err("failed to configure PS/2 mouse: {}", .{err});
+            break :mouse .{};
+        };
+    } else {
+        std.log.warn("PS/2 mouse not found on port 2", .{});
+    }
+
     keyboard.enable() catch |err| {
         std.log.err("failed to enable keyboard: {}", .{err});
     };
+    mouse.enable() catch |err| {
+        std.log.err("failed to enable mouse: {}", .{err});
+    };
 
+    // TODO: Figure out why interruts are coming in while configuring the PS/2 devices
     setupInterrupts() catch |err| {
         std.log.err("failed to setup GDT and IDT: {}", .{err});
         kdebug.halt();
@@ -122,8 +137,7 @@ export fn main() callconv(.{
     asm volatile ("int $0x32" ::: .{ .memory = true });
 
     int.pic.configure();
-    // int.pic.setMask(0xFFFF);
-    int.pic.setEnabled(.{ .keyboard = true });
+    int.pic.setEnabled(.{ .keyboard = true, .mouse = true });
 
     global_video_fb = ozlib.FrameBuffer{
         .raw = @ptrCast(&fb),
@@ -333,6 +347,7 @@ fn setupInterrupts() !void {
 
     // Custom handlers
     idt[0x20 + keyboard.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&keyboardHandler), int_selector, 0, .int, 0);
+    idt[0x20 + mouse.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&mouseHandler), int_selector, 0, .int, 0);
     idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
 
     int.disableInterrupts();
@@ -432,6 +447,12 @@ fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
             cursor_x += 1;
         },
     }
+}
+
+fn mouseHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+    defer int.pic.sendSlaveEoi();
+    const event = global_mouse_controller.handleInterrupt() orelse return;
+    std.log.info("mouse event: {}", .{event});
 }
 
 fn makeExceptionHandler(comptime selector: int.SegmentSelector, comptime name: []const u8, comptime vector: u8, comptime gate_type: int.GateType) int.InterruptDescriptor {

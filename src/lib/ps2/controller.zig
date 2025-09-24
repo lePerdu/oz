@@ -131,15 +131,16 @@ pub const DeviceType = enum {
     mouse,
 };
 
-pub const DeviceCommand = enum(u8) {
-    echo = 0xEE,
+pub const GenericDeviceCommand = enum(u8) {
     identify = 0xF2,
-    enable = 0xF4,
+    enable_scanning = 0xF4,
     disable_scanning = 0xF5,
+    set_defaults = 0xF6,
+    resend = 0xFE,
     reset = 0xFF,
 };
 
-pub const DeviceResponse = enum(u8) {
+pub const GenericDeviceResponse = enum(u8) {
     self_test_passed = 0xAA,
     echo = 0xEE,
     ack = 0xFA,
@@ -157,14 +158,14 @@ pub const port1WaitWrite = waitWriteData;
 /// Write a keyboard command and wait for ACK.
 /// Resends a few times before failing.
 /// TODO: Type checking/switching for cmd and args
-pub fn port1WriteDeviceCommand(cmd: anytype, args: anytype) !DeviceResponse {
+pub fn port1WriteDeviceCommand(cmd: anytype, args: anytype) !GenericDeviceResponse {
     while (true) {
-        try waitWriteData(@intFromEnum(cmd));
+        try port1WaitWrite(@intFromEnum(cmd));
         inline for (args) |arg| {
-            try waitWriteData(arg);
+            try port1WaitWrite(arg);
         }
 
-        const res: DeviceResponse = @enumFromInt(try waitReadData());
+        const res: GenericDeviceResponse = @enumFromInt(try port1WaitRead());
         if (res == .resend) {
             continue;
         } else {
@@ -191,15 +192,14 @@ pub fn port2WaitWrite(data: u8) !void {
     return waitWriteData(data);
 }
 
-pub fn port2WriteDeviceCommand(cmd: anytype, args: anytype) !DeviceResponse {
+pub fn port2WriteDeviceCommand(cmd: anytype, args: anytype) !GenericDeviceResponse {
     while (true) {
         try port2WaitWrite(@intFromEnum(cmd));
         inline for (args) |arg| {
-            writeCommand(.write_port_2_input);
             try port2WaitWrite(arg);
         }
 
-        const res: DeviceResponse = @enumFromInt(try port2WaitRead());
+        const res: GenericDeviceResponse = @enumFromInt(try port2WaitRead());
         if (res == .resend) {
             continue;
         } else {
@@ -296,26 +296,28 @@ fn checkPort1() !DeviceType {
 
     writeCommand(.enable_port_1);
 
-    try port1WriteDeviceCommandWithAck(DeviceCommand.reset, .{});
+    try port1WriteDeviceCommandWithAck(GenericDeviceCommand.reset, .{});
     const reset_res = try port1WaitRead();
-    if (reset_res != @intFromEnum(DeviceResponse.self_test_passed)) {
+    if (reset_res != @intFromEnum(GenericDeviceResponse.self_test_passed)) {
         log.err("device reset failed: {}", .{reset_res});
         return error.SelfTestFailed;
     }
-    const reset_res2 = port1WaitRead() catch null;
-    if (reset_res2 == 0) {
-        log.debug("probable a mouse", .{});
-    }
+    const reset_identify = port1WaitRead() catch null;
     // Disable so that key data doesn't come in while identifying
-    try port1WriteDeviceCommandWithAck(DeviceCommand.disable_scanning, .{});
-    try port1WriteDeviceCommandWithAck(DeviceCommand.identify, .{});
+    try port1WriteDeviceCommandWithAck(GenericDeviceCommand.disable_scanning, .{});
+    try port1WriteDeviceCommandWithAck(GenericDeviceCommand.identify, .{});
     // Both bytes are optional
     const ident1 = port1WaitRead() catch null;
     const ident2 = port1WaitRead() catch null;
     // TODO: Make sure it's actually a keyboard
     log.info("identify: {?} {?}", .{ ident1, ident2 });
 
-    return .keyboard;
+    // TODO: Better identify checking
+    if (reset_identify == 0) {
+        return .mouse;
+    } else {
+        return .keyboard;
+    }
 }
 
 fn checkPort2() !DeviceType {
@@ -338,24 +340,26 @@ fn checkPort2() !DeviceType {
 
     writeCommand(.enable_port_2);
 
-    try port2WriteDeviceCommandWithAck(DeviceCommand.reset, .{});
+    try port2WriteDeviceCommandWithAck(GenericDeviceCommand.reset, .{});
     const reset_res = try port2WaitRead();
-    if (reset_res != @intFromEnum(DeviceResponse.self_test_passed)) {
+    if (reset_res != @intFromEnum(GenericDeviceResponse.self_test_passed)) {
         log.err("device reset failed: {}", .{reset_res});
         return error.SelfTestFailed;
     }
-    const reset_res2 = port2WaitRead() catch null;
-    if (reset_res2 == 0) {
-        log.debug("probable a mouse", .{});
-    }
+    // Some devices (just mice?) send their identify code after reset
+    const reset_identify = port2WaitRead() catch null;
     // Disable so that key data doesn't come in while identifying
-    try port2WriteDeviceCommandWithAck(DeviceCommand.disable_scanning, .{});
-    try port2WriteDeviceCommandWithAck(DeviceCommand.identify, .{});
+    try port2WriteDeviceCommandWithAck(GenericDeviceCommand.disable_scanning, .{});
+    try port2WriteDeviceCommandWithAck(GenericDeviceCommand.identify, .{});
     // Both bytes are optional
     const ident1 = port2WaitRead() catch null;
     const ident2 = port2WaitRead() catch null;
-    // TODO: Make sure it's actually a keyboard
     log.info("identify: {?} {?}", .{ ident1, ident2 });
 
-    return .keyboard;
+    // TODO: Better identify checking
+    if (reset_identify == 0) {
+        return .mouse;
+    } else {
+        return .keyboard;
+    }
 }
