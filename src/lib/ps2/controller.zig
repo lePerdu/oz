@@ -104,12 +104,21 @@ const TIMEOUT_MS = 10;
 const CYCLES_PER_SEC = 1_000_000_000;
 const TIMEOUT_CYCLES = CYCLES_PER_SEC * TIMEOUT_MS / 1000;
 
+pub fn flushReadBuffer() void {
+    while (readStatus().input_buffer_full) {
+        _ = readData();
+        // TODO: Include delay between iterations?
+    }
+}
+
 pub fn waitReadData() error{ReadTimeout}!u8 {
     const endTime = readCycleCounter() +% TIMEOUT_CYCLES;
     while (readCycleCounter() < endTime) {
         // TODO: Better busy wait?
         if (readStatus().output_buffer_full) {
             return readData();
+        } else {
+            asm volatile ("pause");
         }
     }
     return error.ReadTimeout;
@@ -121,6 +130,8 @@ pub fn waitWriteData(data: u8) error{WriteTimeout}!void {
         if (!readStatus().input_buffer_full) {
             writeData(data);
             return;
+        } else {
+            asm volatile ("pause");
         }
     }
     return error.WriteTimeout;
@@ -225,10 +236,7 @@ pub fn configure() !struct { port1: ?DeviceType, port2: ?DeviceType } {
     writeCommand(.disable_port_1);
     writeCommand(.disable_port_2);
 
-    // Flush input buffer
-    while (readStatus().input_buffer_full) {
-        _ = readData();
-    }
+    flushReadBuffer();
 
     // Update config:
     // - Port 1 clock enabled, but interrupts and translation disabled
@@ -274,6 +282,15 @@ pub fn configure() !struct { port1: ?DeviceType, port2: ?DeviceType } {
     const port1_type = checkPort1() catch null;
     const port2_type = if (port2_available) (checkPort2() catch null) else null;
     return .{ .port1 = port1_type, .port2 = port2_type };
+}
+
+pub fn enableInterrupts(port1: bool, port2: bool) !void {
+    writeCommand(.read_config);
+    var config: Config = @bitCast(try waitReadData());
+    config.port_1_int_enable = port1;
+    config.port_2_int_enable = port2;
+    writeCommand(.write_config);
+    try waitWriteData(@bitCast(config));
 }
 
 fn checkPort1() !DeviceType {

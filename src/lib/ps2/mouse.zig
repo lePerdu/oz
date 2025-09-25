@@ -105,12 +105,7 @@ fn event_from_bytes(buffer: [4]u8) Event {
 }
 
 pub fn enable() !void {
-    // TODO: Control interrupt enable somewhere else?
-    ps2.writeCommand(.read_config);
-    var config: ps2.Config = @bitCast(try ps2.waitReadData());
-    config.port_2_int_enable = true;
-    ps2.writeCommand(.write_config);
-    try ps2.waitWriteData(@bitCast(config));
+    std.log.debug("enabling PS/2 mouse", .{});
     // TODO: It is possible for the keyboard to send a byte during this "enable scanning"
     // that would conflict with the ACK?
     // Is there a way around it? Maybe disabling port1 while sending this?
@@ -127,6 +122,7 @@ pub const Controller = struct {
     const Self = @This();
 
     pub fn configure() !Self {
+        std.log.debug("configuring PS/2 mouse", .{});
         var mouse_mode = Mode.default;
         // TODO: Figure out why this isn't working
         // Try upgrade to z-axis

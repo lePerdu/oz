@@ -94,6 +94,15 @@ export fn main() callconv(.{
         kdebug.halt();
     };
 
+    // TODO: Figure out why interruts are coming in while configuring the PS/2 devices
+    setupInterrupts() catch |err| {
+        std.log.err("failed to setup GDT and IDT: {}", .{err});
+        kdebug.halt();
+    };
+    asm volatile ("int $0x32" ::: .{ .memory = true });
+
+    int.pic.configure();
+
     global_font = ozlib.font.Psf1Font.parse(os.heap.page_allocator, &font_data) catch |err| {
         std.log.err("failed to load font: {}", .{err});
         // TODO: Just continue on?
@@ -104,18 +113,24 @@ export fn main() callconv(.{
         std.log.err("failed to configure PS/2 controller: {}", .{err});
         kdebug.halt();
     };
+    var keyboard_enabled = false;
+    var mouse_enabled = false;
 
     if (ps2_port_config.port1 == .keyboard) {
+        keyboard_enabled = true;
         keyboard.configure() catch |err| {
             std.log.err("failed to configure PS/2 keyboard: {}", .{err});
+            keyboard_enabled = false;
         };
     } else {
         std.log.warn("PS/2 keyboard not found on port 1", .{});
     }
 
     if (ps2_port_config.port2 == .mouse) {
+        mouse_enabled = true;
         global_mouse_controller = mouse.Controller.configure() catch |err| mouse: {
             std.log.err("failed to configure PS/2 mouse: {}", .{err});
+            mouse_enabled = false;
             break :mouse .{};
         };
     } else {
@@ -124,20 +139,22 @@ export fn main() callconv(.{
 
     keyboard.enable() catch |err| {
         std.log.err("failed to enable keyboard: {}", .{err});
+        keyboard_enabled = false;
     };
     mouse.enable() catch |err| {
         std.log.err("failed to enable mouse: {}", .{err});
+        mouse_enabled = false;
     };
 
-    // TODO: Figure out why interruts are coming in while configuring the PS/2 devices
-    setupInterrupts() catch |err| {
-        std.log.err("failed to setup GDT and IDT: {}", .{err});
-        kdebug.halt();
+    std.log.debug("enabling keyboard/mouse interrupts", .{});
+    // TODO: Is there a "preferred" order for these?
+    // Do this as a single atomic operations so that controller commands aren't interleaved with keyboard/mouse input
+    ozlib.ps2.controller.enableInterrupts(keyboard_enabled, mouse_enabled) catch |err| {
+        std.log.err("failed to enable PS/2 interrupts: {}", .{err});
+        keyboard_enabled = false;
+        mouse_enabled = false;
     };
-    asm volatile ("int $0x32" ::: .{ .memory = true });
-
-    int.pic.configure();
-    int.pic.setEnabled(.{ .keyboard = true, .mouse = true });
+    int.pic.setEnabled(.{ .keyboard = keyboard_enabled, .mouse = mouse_enabled });
 
     global_video_fb = ozlib.FrameBuffer{
         .raw = @ptrCast(&fb),

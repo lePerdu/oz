@@ -1029,16 +1029,12 @@ const LedStates = packed struct(u8) {
 };
 
 pub fn configure() !void {
+    std.log.debug("configuring PS/2 keyboard", .{});
     try ps2.port1WriteDeviceCommandWithAck(Command.scan_code_sets, .{2});
 }
 
 pub fn enable() !void {
-    // TODO: Control interrupt enable somewhere else?
-    ps2.writeCommand(.read_config);
-    var config: ps2.Config = @bitCast(try ps2.waitReadData());
-    config.port_1_int_enable = true;
-    ps2.writeCommand(.write_config);
-    try ps2.waitWriteData(@bitCast(config));
+    std.log.debug("enabling PS/2 keyboard", .{});
     try ps2.port1WriteDeviceCommandWithAck(ps2.GenericDeviceCommand.enable_scanning, .{});
 }
 
