@@ -2,7 +2,7 @@ const std = @import("std");
 const uefi = std.os.uefi;
 
 const paging = @import("./paging.zig");
-const bootboot = @import("./bootboot.zig");
+const boot = @import("./boot.zig");
 
 /// Interface for allocating physical pages (1 at a time)
 /// TODO: Extend interface to allocate chunks of physical pages
@@ -288,15 +288,15 @@ test "PageBitmap: alloc() can re-use page after free()" {
 /// for bump-style allocation. Does not have the ability to free memory.
 ///
 /// This is only used to bootstrap the real page allocator.
-pub const BootbootMMapPageAllocator = struct {
-    mem_map: []const bootboot.MMapEnt,
+pub const BootinfoMMapPageAllocator = struct {
+    mem_map: []const boot.MMapEnt,
     index: usize = 0,
     /// Track position in the "current" chunk, reset when advancing the iterator
     chunk_offset: usize = 0,
 
     const Self = @This();
 
-    pub fn init(mem_map: []const bootboot.MMapEnt) Self {
+    pub fn init(mem_map: []const boot.MMapEnt) Self {
         return Self{ .mem_map = mem_map };
     }
 
@@ -345,8 +345,8 @@ pub const BootbootMMapPageAllocator = struct {
     }
 };
 
-test BootbootMMapPageAllocator {
-    const Entry = bootboot.MMapEnt;
+test BootinfoMMapPageAllocator {
+    const Entry = boot.MMapEnt;
 
     const map = [_]Entry{
         Entry.init(0, 0x2000, .used),
@@ -356,7 +356,7 @@ test BootbootMMapPageAllocator {
         Entry.init(0x18000, 0x4000, .free),
     };
 
-    var alloc = BootbootMMapPageAllocator.init(&map);
+    var alloc = BootinfoMMapPageAllocator.init(&map);
     try std.testing.expectEqual(0x3, alloc.allocPages(1));
     try std.testing.expectEqual(0x4, alloc.allocPages(5));
     try std.testing.expectEqual(0x9, alloc.allocPages(4));

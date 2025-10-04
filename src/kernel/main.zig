@@ -19,7 +19,7 @@ pub const std_options = std.Options{
     .queryPageSize = queryPageSize,
 };
 
-extern var bootboot: ozlib.bootboot.Bootboot;
+extern var bootinfo: ozlib.boot.Info;
 extern var fb: anyopaque;
 
 extern const _kernel_start: u8;
@@ -87,13 +87,6 @@ export fn main() callconv(.{
     std.log.info("Hello, kernel!", .{});
     std.log.info("Kernel size: {} B ({} KiB)", .{ getKernelSize(), getKernelSize() / 1024 });
 
-    const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
-
-    setupKernelHeap(pml4, bootboot.mmapEntries()) catch |err| {
-        std.log.err("failed setting up heap: {}", .{err});
-        kdebug.halt();
-    };
-
     // TODO: Figure out why interruts are coming in while configuring the PS/2 devices
     setupInterrupts() catch |err| {
         std.log.err("failed to setup GDT and IDT: {}", .{err});
@@ -102,6 +95,16 @@ export fn main() callconv(.{
     asm volatile ("int $0x32" ::: .{ .memory = true });
 
     int.pic.configure();
+    int.pic.setMask(0xFFFF);
+
+    const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
+
+    setupKernelHeap(pml4, bootinfo.mmapEntries()) catch |err| {
+        std.log.err("failed setting up heap: {}", .{err});
+        kdebug.halt();
+    };
+
+    // startupAps();
 
     global_font = ozlib.font.Psf1Font.parse(os.heap.page_allocator, &font_data) catch |err| {
         std.log.err("failed to load font: {}", .{err});
@@ -158,9 +161,9 @@ export fn main() callconv(.{
 
     global_video_fb = ozlib.FrameBuffer{
         .raw = @ptrCast(&fb),
-        .width = bootboot.fb_width,
-        .height = bootboot.fb_height,
-        .pixels_per_row = bootboot.fb_scanline,
+        .width = bootinfo.fb_width,
+        .height = bootinfo.fb_height,
+        .pixels_per_row = bootinfo.fb_scanline,
     };
     std.log.info("Frame buffer: width={} height={}", .{ global_video_fb.width, global_video_fb.height });
     global_video_fb.fill(.fromRgb(0, 0, 0), .fromSize(global_video_fb.width, global_video_fb.height));
@@ -197,14 +200,14 @@ fn renderGradient(video_fb: *ozlib.FrameBuffer, x_offset: i32, y_offset: i32) vo
 }
 
 pub const kernel_heap_vma_start: paging.VirtualAddress = 0xFFFF_C000_0000_0000;
-pub const kernel_heap_vma_end: paging.VirtualAddress = ozlib.bootboot.mmio_start;
+pub const kernel_heap_vma_end: paging.VirtualAddress = ozlib.boot.mmio_start;
 pub const kernel_heap_vma_len: usize = kernel_heap_vma_end - kernel_heap_vma_start;
 
-fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.bootboot.MMapEnt) !void {
+fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt) !void {
     const log = std.log.scoped(.setupKernelHeap);
     log.info("start", .{});
 
-    var bootstrap_page_alloc = ozlib.alloc.BootbootMMapPageAllocator.init(mem_map);
+    var bootstrap_page_alloc = ozlib.alloc.BootinfoMMapPageAllocator.init(mem_map);
     kernel_heap_state.heap_region = .init(
         pml4,
         bootstrap_page_alloc.allocator(),
@@ -230,7 +233,7 @@ fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.bootboot.MMap
     kernel_heap_state.heap_region.page_alloc = kernel_heap_state.page_bitmap.allocator();
 }
 
-fn markInitialUsedPages(bitmap: *ozlib.alloc.PageBitmap, mem_map: []const ozlib.bootboot.MMapEnt) void {
+fn markInitialUsedPages(bitmap: *ozlib.alloc.PageBitmap, mem_map: []const ozlib.boot.MMapEnt) void {
     // Track the end of the previous entry to detect and handle gaps in the memory map
     // The memory map is assumed to be sorted
     var previous_end: paging.PhysicalAddress = 0;
@@ -258,7 +261,7 @@ fn printPageTables(pml4: *paging.PageTable) void {
     paging.visitPageTables(pml4, undefined, printPT);
 }
 
-fn calcAvailableMemoryPages(mem_map: []const ozlib.bootboot.MMapEnt) usize {
+fn calcAvailableMemoryPages(mem_map: []const ozlib.boot.MMapEnt) usize {
     var last_useable_addr: u64 = 0;
     for (mem_map) |ent| {
         if (ent.isFree()) {
@@ -268,71 +271,58 @@ fn calcAvailableMemoryPages(mem_map: []const ozlib.bootboot.MMapEnt) usize {
     return last_useable_addr / paging.page_size;
 }
 
+const kernel_code_seg = 0x08;
+const kernel_data_seg = 0x10;
+const user_code_seg = 0x18;
+const user_data_seg = 0x20;
+const tss_seg = 0x28;
+var gdt: [7]u64 = undefined;
+
+var tss: int.TaskStateSegment = undefined;
+var idt = [_]int.InterruptDescriptor{.empty} ** 256;
+
 fn setupInterrupts() !void {
-    // TODO: This doesn't actually allocate full pages. Is that ok?
-    const page_allocator = os.heap.page_allocator;
-    const region = try page_allocator.alloc(u8, @sizeOf(int.InterruptDescriptorTable) + 4096);
-    @memset(region, 0);
-    var offset: usize = 0;
-
-    const idt: *int.InterruptDescriptorTable = @ptrCast(@alignCast(&region[offset]));
-    offset += @sizeOf(int.InterruptDescriptorTable);
-
-    const tss: *int.TaskStateSegment = @ptrCast(@alignCast(&region[offset]));
-    // TODO: Save pointer and fill in data
-    offset += @sizeOf(@TypeOf(tss.*));
-
-    offset = std.mem.alignForward(usize, offset, @alignOf(int.SegmentDescriptor));
-    const gdt = std.mem.bytesAsSlice(u64, region[offset..]);
     gdt[0] = @bitCast(int.SegmentDescriptor.null_descriptor);
 
-    // Kernel code
-    const kernel_code_index = 1;
-    gdt[1] = @bitCast(int.SegmentDescriptor.initCode(
+    gdt[kernel_code_seg / 8] = @bitCast(int.SegmentDescriptor.initCode(
         0,
         0xFFFFF,
         .{ .privilege_level = 0, .allow_lower = false, .readable = true },
         .{ .granularity = .pages, .protected_mode_32_bit = false, .long_mode = true },
     ));
-    // Kernel data
-    const kernel_data_index = 2;
-    gdt[2] = @bitCast(int.SegmentDescriptor.initData(
+    gdt[kernel_data_seg / 8] = @bitCast(int.SegmentDescriptor.initData(
         0,
         0xFFFFF,
         .{ .privilege_level = 0, .writeable = true },
         .{ .granularity = .pages, .protected_mode_32_bit = true, .long_mode = false },
     ));
-    // User code
-    // const user_code_index = 3;
-    gdt[3] = @bitCast(int.SegmentDescriptor.initCode(
+    gdt[user_code_seg / 8] = @bitCast(int.SegmentDescriptor.initCode(
         0,
         0xFFFFF,
         .{ .privilege_level = 3, .allow_lower = true, .readable = true },
         .{ .granularity = .pages, .protected_mode_32_bit = false, .long_mode = true },
     ));
-    // User data
-    // const user_data_index = 4;
-    gdt[4] = @bitCast(int.SegmentDescriptor.initData(
+    gdt[user_data_seg / 8] = @bitCast(int.SegmentDescriptor.initData(
         0,
         0xFFFFF,
         .{ .privilege_level = 3, .writeable = true },
         .{ .granularity = .pages, .protected_mode_32_bit = true, .long_mode = false },
     ));
 
-    const tss_entry: *int.LongModeSegmentDescriptor = @ptrCast(@alignCast(&gdt[5]));
+    const tss_entry: *int.LongModeSegmentDescriptor = @ptrCast(@alignCast(&gdt[tss_seg / 8]));
     // TSS
     // TODO: Figure out what this is for
     tss_entry.* = @bitCast(int.LongModeSegmentDescriptor.init(
-        @intFromPtr(tss),
-        @sizeOf(@TypeOf(tss.*)),
+        @intFromPtr(&tss),
+        @sizeOf(@TypeOf(tss)),
         .{ .privilege_level = 0, .system_type = .tss_64_available },
         .{ .granularity = .bytes, .protected_mode_32_bit = false, .long_mode = false },
     ));
 
-    const gdt_size = 5 * 8 + 1 * 16;
-    offset += gdt_size;
+    // Max offset so that it's invalid
+    tss.iopb = 0xFFFF;
 
-    const int_selector = int.SegmentSelector{ .privilege_level = 0, .table = .gdt, .index = kernel_code_index };
+    const int_selector = int.SegmentSelector{ .privilege_level = 0, .table = .gdt, .index = kernel_code_seg / 8 };
     idt[0x00] = makeExceptionHandler(int_selector, "divide error", 0x00, .trap);
     idt[0x01] = makeExceptionHandler(int_selector, "debug exception", 0x01, .trap);
     idt[0x02] = makeExceptionHandler(int_selector, "nmi", 0x02, .int);
@@ -370,20 +360,22 @@ fn setupInterrupts() !void {
     int.disableInterrupts();
     std.log.info("interrupts disabled", .{});
 
-    std.log.info("setup GDT: offset={*} limit={}", .{ gdt.ptr, gdt_size - 1 });
-    int.setGdtr(@intFromPtr(gdt.ptr), gdt_size - 1);
+    const gdt_limit = gdt.len * @sizeOf(@TypeOf(gdt[0])) - 1;
+    std.log.info("setup GDT: offset={*} limit={}", .{ &gdt, gdt_limit });
+    int.setGdtr(@intFromPtr(&gdt), gdt_limit);
 
-    std.log.info("setup IDT: offset={*} limit={}", .{ idt, @sizeOf(@TypeOf(idt.*)) - 1 });
-    int.setIdtr(@intFromPtr(idt), @sizeOf(@TypeOf(idt.*)) - 1);
+    const idt_limit = @sizeOf(@TypeOf(idt)) - 1;
+    std.log.info("setup IDT: offset={*} limit={}", .{ &idt, idt_limit });
+    int.setIdtr(@intFromPtr(&idt), idt_limit);
 
-    const kernel_data_selector = int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_data_index };
+    const kernel_data_selector = int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_data_seg / 8 };
     int.setDataSegmentRegister(.ds, kernel_data_selector);
     int.setDataSegmentRegister(.es, kernel_data_selector);
     int.setDataSegmentRegister(.fs, kernel_data_selector);
     int.setDataSegmentRegister(.gs, kernel_data_selector);
     int.setDataSegmentRegister(.ss, kernel_data_selector);
 
-    int.setCodeSegmentRegister(int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_code_index });
+    int.setCodeSegmentRegister(int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_code_seg / 8 });
 
     int.nmiEnable();
 
@@ -546,3 +538,293 @@ fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vecto
 //         .{},
 //     );
 // }
+
+fn getBspid() u16 {
+    var cpuid_ebx: u32 = undefined;
+    asm (
+        \\mov $1, %%eax
+        \\cpuid
+        : [bspid] "={ebx}" (cpuid_ebx),
+        :
+        : .{ .eax = true, .ecx = true, .edx = true });
+    return @intCast(cpuid_ebx >> 24);
+}
+
+const ProcessorInfo = struct {
+    processor_uid: u8,
+    local_apic_id: u8,
+};
+
+fn getNumcoresAcpi(rsdp: *const ozlib.acpi.Rsdp) ?u16 {
+    if (!rsdp.valid()) {
+        std.log.warn("RSDP invalid: {}", .{rsdp});
+        return null;
+    }
+
+    const xsdt = rsdp.xsdtPtr();
+    if (!xsdt.header.valid(ozlib.acpi.Xsdt.SIGNATURE)) {
+        std.log.warn("XSDT invalid: {}", .{xsdt});
+        return null;
+    }
+
+    var numcores: u8 = 0;
+    const madt: *const ozlib.acpi.Madt = xsdt.findTypedTable(ozlib.acpi.Madt) orelse return null;
+    // Can use this directly since pages are identity-mapped
+    var madt_iter = madt.iterator();
+    while (madt_iter.next()) |controller| {
+        std.log.debug("found controller: {}", .{controller});
+        switch (controller) {
+            .local_apic => {
+                numcores += 1;
+            },
+            else => {},
+        }
+    }
+    return numcores;
+}
+
+fn getNumcores(acpi_ptr: ?*anyopaque, mps_ptr: ?*anyopaque) u16 {
+    if (acpi_ptr) |rsdp| {
+        if (!std.mem.isAligned(@intFromPtr(rsdp), @alignOf(ozlib.acpi.Rsdp))) {
+            std.debug.panic("bad RSDP alignment: {*}", .{rsdp});
+        }
+        if (getNumcoresAcpi(@ptrCast(@alignCast(rsdp)))) |n| return n;
+    }
+    _ = mps_ptr;
+    // TODO: Support other methods
+    return 1;
+}
+
+export fn apMain() callconv(.{
+    .x86_64_win = .{
+        // Normal stack alignment is 16 bytes before a `call` instruction. Since
+        // code entering here isn't _called_, there is no return address on the
+        // stack, which behaves like the stack was only 8-byte aligned before
+        // calling this function.
+        // TODO: Fix this by providing a return address instead?
+        .incoming_stack_alignment = 8,
+    },
+}) void {
+    apReady.store(true, .release);
+    std.log.info("AP started!", .{});
+    halt();
+}
+
+fn halt() noreturn {
+    while (true) {
+        asm volatile ("hlt");
+    }
+}
+inline fn pause() void {
+    asm volatile ("pause" ::: .{ .memory = true });
+}
+
+const Pit = struct {
+    const CHANNEL0_PORT = 0x40;
+    const CHANNEL1_PORT = 0x41;
+    const CHANNEL2_PORT = 0x42;
+    const CONTORL_PORT = 0x43;
+
+    const Control = packed struct(u8) {
+        bcd: bool,
+        mode: Mode,
+        rw: RwMode,
+        index: u2,
+    };
+    const Mode = enum(u3) {
+        terminal = 0b000,
+        oneshot = 0b001,
+        rate = 0b010,
+        rate_alt = 0b110,
+        square = 0b011,
+        square_alt = 0b111,
+        sw_strobe = 0b100,
+        hw_strobe = 0b101,
+    };
+    const RwMode = enum(u2) {
+        latch = 0,
+        lsb_only = 1,
+        msb_only = 2,
+        lsb_msb = 3,
+    };
+
+    const ReadBackCommand = packed struct(u8) {
+        _reserved1: u1 = 0,
+        counter0: bool,
+        counter1: bool,
+        counter2: bool,
+        status_latch_disable: bool,
+        counter_latch_disable: bool,
+        _reserved2: u2 = 3,
+    };
+    const ReadBackStatus = packed struct(u8) {
+        bcd: bool,
+        mode: Mode,
+        rw: RwMode,
+        null_count: bool,
+        output: bool,
+    };
+};
+
+fn sleep(micros: usize) void {
+    _ = micros;
+    // uefi.system_table.boot_services.?.stall(micros) catch {};
+}
+
+var apReady: std.atomic.Value(bool) = .init(false);
+var bspDone: std.atomic.Value(bool) = .init(false);
+
+extern const ap_trampoline: u8;
+extern const ap_trampoline_end: u8;
+
+const ap_trampoline_load_addr = 0x8000;
+
+const LocalApic = ozlib.interrupt.apic.Local;
+
+fn startupAps() void {
+    var local_apic_ptr: ?*volatile LocalApic = null;
+    var proc_infos: [255]?*align(1) const ozlib.acpi.Madt.LocalApic = .{null} ** 255;
+
+    const rsdp: *const ozlib.acpi.Rsdp = @ptrFromInt(bootinfo.acpi_ptr);
+
+    if (!rsdp.valid()) {
+        std.log.warn("RSDP invalid: {}", .{rsdp});
+        return;
+    }
+
+    const xsdt = rsdp.xsdtPtr();
+    if (!xsdt.header.valid(ozlib.acpi.Xsdt.SIGNATURE)) {
+        std.log.warn("XSDT invalid: {}", .{xsdt});
+        return;
+    }
+
+    const madt: *const ozlib.acpi.Madt = xsdt.findTypedTable(ozlib.acpi.Madt) orelse return;
+    // Can use this directly since pages are identity-mapped
+    local_apic_ptr = @ptrFromInt(madt.local_controller_addr);
+    var madt_iter = madt.iterator();
+    var numcores: usize = 0;
+    while (madt_iter.next()) |controller| {
+        std.log.debug("found controller: {}", .{controller});
+        switch (controller) {
+            .local_apic => |local_apic| {
+                std.log.debug("found LAPIC: {*}={}", .{ local_apic, local_apic.* });
+                proc_infos[numcores] = local_apic;
+                numcores += 1;
+            },
+            .local_apic_address_override => |override| {
+                local_apic_ptr = @ptrFromInt(override.addr);
+            },
+            else => {},
+        }
+    }
+
+    // TODO: Check mem map to make sure this is free (or dynamically allocate it)
+    const ap_trampoline_page: *[4096]u8 align(4096) = @ptrCast(ap_trampoline_load_addr);
+    std.log.debug("ap_load_addr: {*}", .{ap_trampoline_page});
+    // TODO: Compute ap_trampoline size and only copy that much
+    @memcpy(ap_trampoline_page, @as([*]const u8, @ptrCast(&ap_trampoline))[0..4096]);
+
+    const ap_cr3: *u64 = @ptrFromInt(0x80C0);
+    ap_cr3.* = ozlib.paging.getRootPageTable();
+    // const ap_cs: *u32 = @ptrFromInt(0x80CC);
+    // const ap_ds: *u32 = @ptrFromInt(0x80D0);
+    asm volatile (
+        \\movl %%cs, %%eax
+        \\movl %%eax, 0x80CC
+        \\movl %%ds, %%eax
+        \\movl %%eax, 0x80D0
+        ::: .{ .memory = true });
+    const ap_gdtr: *ozlib.interrupt.DescriptorTableRegister = @ptrFromInt(0x80E0);
+    ap_gdtr.* = ozlib.interrupt.getGdtr();
+    const ap_main: *u64 = @ptrFromInt(0x80D8);
+    ap_main.* = @intFromPtr(&apMain);
+
+    if (local_apic_ptr) |lapic| {
+        lapic.set(.local_dest, LocalApic.Destination{ .target = 1 });
+        lapic.set(.dest_fmt, LocalApic.DestinationFormat{ .model = .flat });
+        lapic.set(.spurious, LocalApic.SpuriousVector{ .vector = 0xFF, .enable = true });
+        lapic.set(.tpr, 0);
+        const bsp_apic_id = lapic.getId();
+        std.log.debug("BSP LAPIC ID: {}", .{bsp_apic_id});
+
+        // TODO: For APS
+        //
+        // enable Local APIC
+        // *((volatile uint32_t*)(lapic_addr + 0x0F0)) = *((volatile uint32_t*)(lapic_addr + 0x0F0)) | 0x100;
+        // core_num = lapic_ids[*((volatile uint32_t*)(lapic_addr + 0x20)) >> 24];
+
+        std.log.debug("starting {} APs", .{numcores - 1});
+        var successfulStarted: u8 = 0;
+        for (0..numcores) |proc_index| {
+            const info = proc_infos[proc_index] orelse continue;
+            const lapic_id = info.id;
+            const proc_uid = info.processor_uid;
+            if (lapic_id == bsp_apic_id) continue;
+
+            apReady.store(false, .release);
+            std.log.debug("starting AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+
+            std.log.debug("sending INIT IPI", .{});
+            lapic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init });
+            // TOOD: Poll more frequently
+            sleep(LocalApic.ipi_delivery_timeout_us);
+            if (lapic.ipiPending()) {
+                std.log.err("failed to send INIT IPI: {}", .{lapic.getErrorStatus()});
+                continue;
+            }
+            std.log.debug("sent INIT IPI", .{});
+            sleep(1);
+
+            std.log.debug("sending INIT IPI de-assert", .{});
+            lapic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init, .level_assert = false, .level_triggered = true });
+            // TOOD: Poll more frequently
+            sleep(LocalApic.ipi_delivery_timeout_us);
+            if (lapic.ipiPending()) {
+                std.log.err("failed to send INIT de-assert IPI: {}", .{lapic.getErrorStatus()});
+                continue;
+            }
+            std.log.debug("sent INIT IPI de-assert", .{});
+            sleep(10_000);
+
+            std.log.debug("sending STARTUP IPI 1", .{});
+            const startupVector: u8 = @intCast(ap_trampoline_load_addr / 4096);
+            lapic.sendIpi(lapic_id, .{ .vector = startupVector, .delivery_mode = .startup });
+            // TOOD: Poll more frequently
+            sleep(LocalApic.ipi_delivery_timeout_us);
+            if (lapic.ipiPending()) {
+                std.log.err("failed to send STARTUP IPI 1: {}", .{lapic.getErrorStatus()});
+                continue;
+            }
+            std.log.debug("sent STARTUP IPI 1", .{});
+            // sleep(200);
+            sleep(1000);
+
+            std.log.debug("checking apDone", .{});
+            if (!apReady.load(.acquire)) {
+                std.log.debug("sending STARTUP IPI 2", .{});
+                lapic.sendIpi(lapic_id, .{ .vector = startupVector, .delivery_mode = .startup });
+                // TOOD: Poll more frequently
+                sleep(LocalApic.ipi_delivery_timeout_us);
+                if (lapic.ipiPending()) {
+                    std.log.err("failed to send STARTUP IPI 2: {}", .{lapic.getErrorStatus()});
+                    continue;
+                }
+                std.log.debug("sent STARTUP IPI 2", .{});
+                // sleep(200);
+
+                sleep(1_000_000);
+                std.log.debug("checking apDone", .{});
+                if (!apReady.load(.acquire)) {
+                    std.log.err("failed to start AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+                    continue;
+                }
+            }
+
+            std.log.debug("started AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+            successfulStarted += 1;
+        }
+        std.log.debug("successfully started {} APs", .{successfulStarted});
+    } else {
+        std.log.warn("LAPIC addr not found", .{});
+    }
+}

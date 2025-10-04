@@ -10,15 +10,9 @@ pub const std_options = std.Options{
     .logFn = ozlib.io.debugConsoleLog,
 };
 
-/// Structure to keep track of bootloader allocations so that they can be marked
-/// as not-free in the memory map
-/// TODO: Make non-global?
-/// TODO: Use a custom "MemoryType" in UEFI allocations instead?
-var alloc_state: struct {
-    bootboot: ?*anyopaque = null,
-    kernel: ?*anyopaque = null,
-    page_tables_and_stack: ?*anyopaque = null,
-} = .{};
+const bootinfo_mem_type = uefi.tables.MemoryType.fromVendor(1);
+const kernel_mem_type = uefi.tables.MemoryType.fromVendor(2);
+const page_tables_mem_type = uefi.tables.MemoryType.fromVendor(3);
 
 fn loadKernelFile() !*uefi.protocol.File {
     const log = std.log.scoped(.loadKernelFile);
@@ -55,11 +49,9 @@ fn allocKernelPages(kernel_size: usize) ![]align(paging.page_size) u8 {
 
     const kernel_pages = try uefi.system_table.boot_services.?.allocatePages(
         .any,
-        // TODO: custom type?
-        .loader_data,
+        kernel_mem_type,
         kernel_page_count,
     );
-    alloc_state.kernel = kernel_pages.ptr;
 
     // TODO: Allow non-contiguous pages
     log.debug("end", .{});
@@ -95,12 +87,11 @@ const UefiPageTableAllocator = struct {
 
     const Self = @This();
 
-    pub fn init(total_pages: usize) !Self {
+    pub fn init(total_pages: usize, mem_type: uefi.tables.MemoryType) !Self {
         const allocated =
             try uefi.system_table.boot_services.?.allocatePages(
                 .any,
-                // TODO: Use custom type to make it easier to distinguish later?
-                .loader_data,
+                mem_type,
                 total_pages,
             );
         // TODO: Fallback to allocating pages in smaller chunks, since they don't actually need to be contiguous
@@ -223,7 +214,7 @@ fn initLargePage(page_num: paging.PageNum) paging.PageTableEntry {
 }
 
 fn createPageTables(
-    info: *ozlib.bootboot.Bootboot,
+    info: *ozlib.boot.Info,
     kernel_pages: []align(4096) u8,
 ) !*paging.PageTable {
     const log = std.log.scoped(.createPageTables);
@@ -256,13 +247,12 @@ fn createPageTables(
     const kernel_data_pts = 1;
     // Not used as a page table, but it's conventient to use the same page frame
     // allocator
-    const kernel_stack_pages = ozlib.bootboot.kernel_stack_pages;
+    const kernel_stack_pages = ozlib.boot.kernel_stack_pages;
 
-    const total_pages =
+    const total_page_table_pages =
         root_pml4s +
         ident_pdpts + ident_pds +
-        kernel_pdpts + kernel_pds + fb_pts + kernel_data_pts +
-        kernel_stack_pages;
+        kernel_pdpts + kernel_pds + fb_pts + kernel_data_pts;
 
     log.debug("pages required: {}", .{.{
         .ident_pdpts = ident_pdpts,
@@ -270,28 +260,27 @@ fn createPageTables(
         .kernel_pds = kernel_pds,
         .fb_pts = fb_pts,
         .kernel_data_pts = kernel_data_pts,
-        .total = total_pages,
+        .total_page_tables = total_page_table_pages,
 
         .stack_pages = kernel_stack_pages,
         .fb_pages = fb_pages,
     }});
 
-    var alloc = try UefiPageTableAllocator.init(total_pages);
-    alloc_state.page_tables_and_stack = alloc.allocated_group.ptr;
+    var page_table_alloc = try UefiPageTableAllocator.init(total_page_table_pages, page_tables_mem_type);
 
     const ptr2Page = paging.pointerToPageNum;
 
-    const pml4 = alloc.next().?;
+    const pml4 = page_table_alloc.next().?;
 
     {
         // Identity-map first 16GiB
         log.debug("creating identity tables", .{});
         defer log.debug("done creating identity tables", .{});
 
-        const pdpt = alloc.next().?;
+        const pdpt = page_table_alloc.next().?;
         pml4.entries[0] = initSmallPage(ptr2Page(pdpt));
         for (0..ident_pds) |pdpt_index| {
-            const pd = alloc.next().?;
+            const pd = page_table_alloc.next().?;
             pdpt.entries[pdpt_index] = initSmallPage(ptr2Page(pd));
 
             for (0..512) |pd_index| {
@@ -301,12 +290,12 @@ fn createPageTables(
         }
     }
 
-    const kernel_pdpt = alloc.next().?;
-    comptime std.debug.assert(paging.getPml4Index(ozlib.bootboot.fb_start) == 511);
+    const kernel_pdpt = page_table_alloc.next().?;
+    comptime std.debug.assert(paging.getPml4Index(ozlib.boot.fb_start) == 511);
     pml4.entries[511] = initSmallPage(ptr2Page(kernel_pdpt));
 
-    const kernel_pd = alloc.next().?;
-    comptime std.debug.assert(paging.getPdptIndex(ozlib.bootboot.fb_start) == 511);
+    const kernel_pd = page_table_alloc.next().?;
+    comptime std.debug.assert(paging.getPdptIndex(ozlib.boot.fb_start) == 511);
     kernel_pdpt.entries[511] = initSmallPage(ptr2Page(kernel_pd));
 
     fb: {
@@ -314,10 +303,10 @@ fn createPageTables(
         log.debug("creating fb tables", .{});
         defer log.debug("done creating fb tables", .{});
 
-        comptime std.debug.assert(paging.getPtIndex(ozlib.bootboot.fb_start) == 0);
-        const pd_start_index = paging.getPdIndex(ozlib.bootboot.fb_start);
+        comptime std.debug.assert(paging.getPtIndex(ozlib.boot.fb_start) == 0);
+        const pd_start_index = paging.getPdIndex(ozlib.boot.fb_start);
         for (0..fb_pts, pd_start_index..) |pd_offset, pd_index| {
-            const pt = alloc.next().?;
+            const pt = page_table_alloc.next().?;
             kernel_pd.entries[pd_index] = initSmallPage(ptr2Page(pt));
 
             for (0..512) |pt_index| {
@@ -333,29 +322,32 @@ fn createPageTables(
 
     log.debug("creating kernel tables", .{});
 
-    comptime std.debug.assert(paging.getPdIndex(ozlib.bootboot.bootboot_start) == 511);
-    const kernel_data_pt = alloc.next().?;
+    comptime std.debug.assert(paging.getPdIndex(ozlib.boot.bootinfo_start) == 511);
+    const kernel_data_pt = page_table_alloc.next().?;
     kernel_pd.entries[511] = initSmallPage(ptr2Page(kernel_data_pt));
 
-    comptime std.debug.assert(paging.getPtIndex(ozlib.bootboot.bootboot_start) == 0);
+    comptime std.debug.assert(paging.getPtIndex(ozlib.boot.bootinfo_start) == 0);
     kernel_data_pt.entries[0] = initSmallPage(ptr2Page(info));
 
-    comptime std.debug.assert(paging.getPtIndex(ozlib.bootboot.kernel_start) == 2);
+    comptime std.debug.assert(paging.getPtIndex(ozlib.boot.kernel_start) == 2);
     const base_kernel_page = paging.pointerToPageNum(kernel_pages.ptr);
     const kernel_page_count = paging.pagesRequired(kernel_pages.len);
     for (0..kernel_page_count, 2.., base_kernel_page..) |_, pt_index, page| {
         kernel_data_pt.entries[pt_index] = initSmallPage(@intCast(page));
     }
 
-    // comptime std.debug.assert(paging.getPtIndex(ozlib.bootboot.kernel_stack_start) == 508);
+    var stack_page_alloc = try UefiPageTableAllocator.init(kernel_stack_pages, kernel_mem_type);
+
+    // comptime std.debug.assert(paging.getPtIndex(ozlib.bootinfo.kernel_stack_start) == 508);
     // const kernel_stack_page = alloc.nextRaw().?;
     // kernel_data_pt.entries[511] = initSmallPage(alloc.nextRaw().?);
-    comptime std.debug.assert(paging.getPtIndex(ozlib.bootboot.kernel_stack_start) == 512 - kernel_stack_pages);
+    comptime std.debug.assert(paging.getPtIndex(ozlib.boot.kernel_stack_start) == 512 - kernel_stack_pages);
     for (512 - kernel_stack_pages..512) |pt_index| {
-        kernel_data_pt.entries[pt_index] = initSmallPage(alloc.nextRaw().?);
+        kernel_data_pt.entries[pt_index] = initSmallPage(stack_page_alloc.nextRaw().?);
     }
 
-    std.debug.assert(alloc.next() == null);
+    std.debug.assert(stack_page_alloc.next() == null);
+    std.debug.assert(page_table_alloc.next() == null);
 
     log.debug("done", .{});
     return pml4;
@@ -441,7 +433,6 @@ fn queryMemMap() !uefi.tables.MemoryMapSlice {
 
     // Use poll_allocator here since this doesn't need to be passed onto the OS
     // NOTE: This is not explicitly freed; it is just not marked as special in the memory map given to the OS
-    // TODO: Use custom memory descriptor type?
     const mem_map_buf = try uefi.pool_allocator.alignedAlloc(
         u8,
         .of(uefi.tables.MemoryDescriptor),
@@ -464,18 +455,7 @@ fn queryMemMap() !uefi.tables.MemoryMapSlice {
     return mem_map;
 }
 
-fn memDescContains(desc: *uefi.tables.MemoryDescriptor, ptr: ?*anyopaque) bool {
-    const addr: paging.PhysicalAddress = @intFromPtr(ptr);
-    return desc.physical_start <= addr and addr < desc.physical_start + desc.number_of_pages * 4096;
-}
-
-fn getMemEntType(desc: *uefi.tables.MemoryDescriptor) ozlib.bootboot.MMapType {
-    if (memDescContains(desc, alloc_state.bootboot) or
-        memDescContains(desc, alloc_state.kernel) or
-        memDescContains(desc, alloc_state.page_tables_and_stack))
-    {
-        return .used;
-    }
+fn getMemEntType(desc: *uefi.tables.MemoryDescriptor) ozlib.boot.MMapType {
     return switch (desc.type) {
         .loader_code,
         .loader_data,
@@ -485,27 +465,29 @@ fn getMemEntType(desc: *uefi.tables.MemoryDescriptor) ozlib.bootboot.MMapType {
         => .free,
         .acpi_memory_nvs, .acpi_reclaim_memory => .acpi,
         .memory_mapped_io, .memory_mapped_io_port_space => .mmio,
+        // TOOD: Add memory types to distinguish between bootinfo, kernel, and page table
+        // allocations so the kernel can re-use some of the pages
         else => .used,
     };
 }
 
 fn parseMemMap(
-    bootinfo: *ozlib.bootboot.Bootboot,
+    bootinfo: *ozlib.boot.Info,
     mem_map: uefi.tables.MemoryMapSlice,
 ) !void {
     var dst_buf = bootinfo.mmapEntriesBuf();
     var dst_index: usize = 0;
 
-    const MMapEnt = ozlib.bootboot.MMapEnt;
+    const MMapEnt = ozlib.boot.MMapEnt;
 
     var iter = mem_map.iterator();
     while (iter.next()) |entry| {
         std.log.debug("UEFI mem map entry: {}", .{entry});
-        if (dst_index >= ozlib.bootboot.Bootboot.max_mmap_entries) {
+        if (dst_index >= ozlib.boot.Info.max_mmap_entries) {
             return error.TooManyMemoryMapEntries;
         }
 
-        const typ: ozlib.bootboot.MMapType = getMemEntType(entry);
+        const typ: ozlib.boot.MMapType = getMemEntType(entry);
         const new_entry = MMapEnt.init(
             entry.physical_start,
             entry.number_of_pages * paging.page_size,
@@ -527,35 +509,22 @@ fn parseMemMap(
     bootinfo.setMMapEntriesLen(dst_index);
 
     for (bootinfo.mmapEntries()) |entry| {
-        std.log.debug("Bootboot mem map entry: {}", .{.{ .ptr = entry.ptr, .size = entry.getSizeBytes(), .type = entry.getType() }});
+        std.log.debug("Bootinfo mem map entry: {}", .{.{ .ptr = entry.ptr, .size = entry.getSizeBytes(), .type = entry.getType() }});
     }
 }
 
-fn getBspid() u16 {
-    var cpuid_ebx: u32 = undefined;
-    asm (
-        \\mov $1, %%eax
-        \\cpuid
-        : [bspid] "={ebx}" (cpuid_ebx),
-        :
-        : .{ .eax = true, .ecx = true, .edx = true });
-    return @intCast(cpuid_ebx >> 24);
-}
-
-fn initBootboot(fb: *uefi.protocol.GraphicsOutput) !*ozlib.bootboot.Bootboot {
-    const bootboot_pages = try uefi.system_table.boot_services.?.allocatePages(
+fn initBootinfo(fb: *uefi.protocol.GraphicsOutput) !*ozlib.boot.Info {
+    const bootinfo_pages = try uefi.system_table.boot_services.?.allocatePages(
         .any,
-        // TODO: Custom type?
-        .loader_data,
+        bootinfo_mem_type,
         1,
     );
-    const ptr: *ozlib.bootboot.Bootboot = @ptrCast(bootboot_pages.ptr);
-    alloc_state.bootboot = ptr;
+    const ptr: *ozlib.boot.Info = @ptrCast(bootinfo_pages.ptr);
 
-    const fb_type: ozlib.bootboot.FbType = switch (fb.mode.info.pixel_format) {
+    const fb_type: ozlib.boot.FbType = switch (fb.mode.info.pixel_format) {
         .red_green_blue_reserved_8_bit_per_color => .abgr,
         .blue_green_red_reserved_8_bit_per_color => .argb,
-        // TODO: Parse this in case it's one of the valid types
+        // TODO: Parse this in case it's a well-known format
         .bit_mask => .none,
         .blt_only => .none,
     };
@@ -592,19 +561,17 @@ fn initBootboot(fb: *uefi.protocol.GraphicsOutput) !*ozlib.bootboot.Bootboot {
     };
 
     ptr.* = .{
-        .magic = ozlib.bootboot.magic,
-        .protocol = .{
-            .big_endian = false,
-            .level = .static,
-            .loader = .uefi,
-        },
+        // .protocol = .{
+        //     .big_endian = false,
+        //     .level = .static,
+        //     .loader = .uefi,
+        // },
 
-        // TODO: Support SMP
-        .numcores = 1,
-        .bspid = getBspid(),
+        // .numcores = getNumcores(acpi_ptr, mps_ptr),
+        // .bspid = bspid,
         // TODO: Support initrd
-        .initrd_ptr = 0,
-        .initrd_size = 0,
+        // .initrd_ptr = 0,
+        // .initrd_size = 0,
 
         .fb_ptr = fb.mode.frame_buffer_base,
         .fb_size = @intCast(fb.mode.frame_buffer_size),
@@ -613,21 +580,17 @@ fn initBootboot(fb: *uefi.protocol.GraphicsOutput) !*ozlib.bootboot.Bootboot {
         .fb_scanline = fb.mode.info.pixels_per_scan_line,
         .fb_type = fb_type,
 
-        // TODO: Fetch time/date info
-        .timezone = 0,
-        .datetime = std.mem.zeroes(ozlib.bootboot.Datetime),
+        // TODO: Fetch time/date info?
+        // .timezone = 0,
+        // .datetime = std.mem.zeroes(ozlib.boot.Datetime),
 
-        .platform = .{
-            .x64_64 = .{
-                .efi_ptr = @intFromPtr(uefi.system_table),
-                .acpi_ptr = @intFromPtr(acpi_ptr),
-                .mp_ptr = @intFromPtr(mps_ptr),
-                .smbi_ptr = @intFromPtr(smbios_ptr),
-            },
-        },
+        .efi_ptr = @intFromPtr(uefi.system_table),
+        .acpi_ptr = @intFromPtr(acpi_ptr),
+        .mp_ptr = @intFromPtr(mps_ptr),
+        .smbi_ptr = @intFromPtr(smbios_ptr),
 
         .mmap = .{},
-        .size = ozlib.bootboot.Bootboot.computeSize(0),
+        .size = ozlib.boot.Info.computeSize(0),
     };
 
     return ptr;
@@ -652,33 +615,20 @@ fn zigMain() !void {
 
     log.info("Hello, loader!", .{});
 
-    const loaded_image = (try uefi.system_table.boot_services.?.handleProtocol(
-        uefi.protocol.LoadedImage,
-        uefi.handle,
-    )).?;
-
     log.debug("initializing frame buffer", .{});
     const fb = try setupFrameBuffer();
     log.debug("initialized frame buffer: {x}", .{fb.mode.frame_buffer_base});
 
-    log.debug("allocating bootboot structure", .{});
-    const bootboot = try initBootboot(fb);
-    log.debug("allocated bootboot structure: {*}", .{bootboot});
-
-    const watch_ptr: *volatile u32 = @ptrFromInt(0x10000);
-    const base_ptr: *volatile u64 = @ptrFromInt(0x10008);
-    watch_ptr.* = 0xDEADBEEF;
-    base_ptr.* = @intFromPtr(loaded_image.image_base);
+    log.debug("allocating bootinfo structure", .{});
+    const bootinfo = try initBootinfo(fb);
+    log.debug("allocated bootinfo structure: {*}", .{bootinfo});
 
     const kernel_pages = try loadKernel();
 
-    const pml4 = try createPageTables(bootboot, kernel_pages);
+    const pml4 = try createPageTables(bootinfo, kernel_pages);
 
     const mem_map = try queryMemMap();
-    try parseMemMap(bootboot, mem_map);
-
-    log.info("current GDT: base={x} limit={}", .{ ozlib.interrupt.getGdtr().base, ozlib.interrupt.getGdtr().limit });
-    log.info("current IDT: base={x} limit={}", .{ ozlib.interrupt.getIdtr().base, ozlib.interrupt.getIdtr().limit });
+    try parseMemMap(bootinfo, mem_map);
 
     log.debug("exiting boot services", .{});
     uefi.system_table.boot_services.?.exitBootServices(uefi.handle, mem_map.info.key) catch |err| {
@@ -687,22 +637,23 @@ fn zigMain() !void {
     };
     log.debug("exited boot services", .{});
 
-    log.debug("setting up page table: {*}", .{pml4});
-    paging.setRootPageTable(@intFromPtr(pml4));
-
+    // TODO: Fully disable interrupts?
     ozlib.interrupt.pic.setEnabled(.{});
     ozlib.interrupt.nmiDisable();
 
-    log.debug("entering kernel: {x}", .{ozlib.bootboot.kernel_start});
+    log.debug("setting up page table: {*}", .{pml4});
+    paging.setRootPageTable(@intFromPtr(pml4));
+
+    log.debug("entering kernel: {x}", .{ozlib.boot.kernel_start});
 
     // xor trick when kernel stack starts at 0
-    comptime std.debug.assert(ozlib.bootboot.kernel_stack_init == 0);
+    comptime std.debug.assert(ozlib.boot.kernel_stack_init == 0);
     asm volatile (
         \\xorq %%rsp, %%rsp
         \\pushq %[main]
         \\ret
         :
-        : [main] "i" (ozlib.bootboot.kernel_start),
+        : [main] "i" (ozlib.boot.kernel_start),
     );
 }
 

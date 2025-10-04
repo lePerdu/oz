@@ -1,11 +1,12 @@
 const std = @import("std");
+pub const acpi = @import("acpi.zig");
 pub const io = @import("io.zig");
 pub const port_io = @import("port_io.zig");
 pub const fb = @import("framebuffer.zig");
 pub const FrameBuffer = fb.FrameBuffer;
 pub const paging = @import("paging.zig");
 pub const alloc = @import("alloc.zig");
-pub const bootboot = @import("bootboot.zig");
+pub const boot = @import("boot.zig");
 pub const interrupt = @import("interrupt.zig");
 pub const ps2 = @import("ps2/root.zig");
 pub const font = @import("font.zig");

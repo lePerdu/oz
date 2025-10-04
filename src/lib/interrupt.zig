@@ -2,6 +2,8 @@ const std = @import("std");
 
 const port_io = @import("port_io.zig");
 
+pub const apic = @import("interrupt/apic.zig");
+
 pub fn enableInterrupts() void {
     asm volatile ("sti");
 }
@@ -364,7 +366,7 @@ pub const Granularity = enum(u1) {
 };
 
 pub const TaskStateSegment = extern struct {
-    _reserved0: u32 align(4) = 0,
+    _reserved0: u32 = 0,
     rsp0: u64 align(4),
     rsp1: u64 align(4),
     rsp2: u64 align(4),
@@ -377,12 +379,11 @@ pub const TaskStateSegment = extern struct {
     ist6: u64 align(4),
     ist7: u64 align(4),
     _reserved2: u64 align(4) = 0,
-    _reserved3: u16 align(2) = 0,
-    iopb: u16 align(2),
+    _reserved3: u16 = 0,
+    iopb: u16,
 
     comptime {
-        std.debug.assert(@sizeOf(@This()) == 0x68);
-        std.debug.assert(@alignOf(@This()) == 4);
+        if (@sizeOf(@This()) != 0x68) @compileError(std.fmt.comptimePrint("invalid TSS size: {}", .{@sizeOf(@This())}));
     }
 };
 
@@ -401,6 +402,9 @@ pub const InterruptDescriptor = packed struct(u128) {
     _reserved2: u32 = 0,
 
     const Self = @This();
+
+    // present = false
+    pub const empty = std.mem.zeroes(Self);
 
     pub fn init(offset: u64, selector: SegmentSelector, ist: u3, gate_type: GateType, level: PrivilegeLevel) Self {
         return .{
@@ -429,4 +433,5 @@ pub const TableSelector = enum(u1) {
 pub const GateType = enum(u4) {
     int = 0xE,
     trap = 0xF,
+    _,
 };

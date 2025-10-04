@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) void {
         .stack_check = true,
     });
     kernel_mod.addAssemblyFile(b.path("src/kernel/bootstrap.s"));
+    kernel_mod.addAssemblyFile(b.path("src/kernel/ap_trampoline.s"));
 
     // const zigimg_dependency = b.dependency("zigimg", .{
     //     .target = kernel_target,
