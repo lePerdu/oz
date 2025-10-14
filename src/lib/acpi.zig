@@ -203,7 +203,7 @@ pub const Madt = extern struct {
         _,
     };
 
-    pub const ControllerHeader = packed struct {
+    pub const ControllerHeader = extern struct {
         _type: InterruptControllerType,
         length: u8,
     };
@@ -219,7 +219,7 @@ pub const Madt = extern struct {
         local_sapic: *align(1) const LocalSApic,
         local_x2apic: *align(1) const LocalX2Apic,
         local_x2apic_nmi: *align(1) const LocalX2ApicNmi,
-        unknown: *align(1) const ControllerHeader,
+        unknown: *const ControllerHeader,
 
         pub fn fromHeader(header: *const ControllerHeader) Controller {
             return switch (header._type) {
@@ -265,7 +265,7 @@ pub const Madt = extern struct {
         }
     };
 
-    pub const LocalApic = packed struct {
+    pub const LocalApic = extern struct {
         header: ControllerHeader,
         processor_uid: u8,
         id: u8,
@@ -278,7 +278,7 @@ pub const Madt = extern struct {
         };
     };
 
-    pub const IoApic = packed struct {
+    pub const IoApic = extern struct {
         header: ControllerHeader,
         id: u8,
         _reserved: u8 = 0,
@@ -307,34 +307,34 @@ pub const Madt = extern struct {
         };
     };
 
-    pub const InterruptSourceOverride = packed struct {
+    pub const InterruptSourceOverride = extern struct {
         header: ControllerHeader,
         bus: u8 = 0,
         source_irq: u8,
-        interrupt: u8,
+        gsi: u32,
         flags: MpsIntiFlags,
     };
 
-    pub const NmiSource = packed struct {
+    pub const NmiSource = extern struct {
         header: ControllerHeader,
         flags: MpsIntiFlags,
-        interrupt: u32,
+        gsi: u32,
     };
 
-    pub const LocalApicNmi = packed struct {
+    pub const LocalApicNmi = extern struct {
         header: ControllerHeader,
         processor_uid: u8,
-        flags: MpsIntiFlags,
+        flags: MpsIntiFlags align(1),
         lintn: u8,
     };
 
-    pub const LocalApicAddressOverride = packed struct {
+    pub const LocalApicAddressOverride = extern struct {
         header: ControllerHeader,
         _reserved: u16 = 0,
-        addr: u64,
+        addr: u64 align(4),
     };
 
-    pub const IoSApic = packed struct {
+    pub const IoSApic = extern struct {
         header: ControllerHeader,
         id: u8,
         _reserved: u8 = 0,
@@ -342,26 +342,25 @@ pub const Madt = extern struct {
         addr: u64,
     };
 
-    pub const LocalSApic = packed struct {
+    pub const LocalSApic = extern struct {
         header: ControllerHeader,
         processor_uid: u8,
         id: u8,
         eid: u8,
-        _reserved: u24 = 0,
+        _reserved: [3]u8 = .{ 0, 0, 0 },
         flags: LocalApic.LocalApicFlags,
         processor_uid_value: u32,
-        _processor_uid_string_start: void,
+        _processor_uid_string_start: [1]u8,
     };
 
-    pub const PlatformInterruptSource = packed struct {
+    pub const PlatformInterruptSource = extern struct {
         header: ControllerHeader,
         flags: MpsIntiFlags,
         interrupt_type: InterruptType,
-        processor_uid: u8,
-        id: u8,
-        eid: u8,
+        processor_id: u8,
+        processor_eid: u8,
         io_sapic_vector: u8,
-        interrupt: u32,
+        gsi: u32,
         source_flags: SourceFlags,
 
         pub const InterruptType = enum(u8) {
@@ -377,7 +376,7 @@ pub const Madt = extern struct {
         };
     };
 
-    pub const LocalX2Apic = packed struct {
+    pub const LocalX2Apic = extern struct {
         header: ControllerHeader,
         _reserved: u16 = 0,
         id: u32,
@@ -385,11 +384,11 @@ pub const Madt = extern struct {
         processor_uid: u32,
     };
 
-    pub const LocalX2ApicNmi = packed struct {
+    pub const LocalX2ApicNmi = extern struct {
         header: ControllerHeader,
         flags: MpsIntiFlags,
         processor_uid: u32,
         lintn: u8,
-        _reserved: u24,
+        _reserved: [3]u8 = .{ 0, 0, 0 },
     };
 };

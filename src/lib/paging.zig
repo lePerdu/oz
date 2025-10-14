@@ -50,10 +50,10 @@ pub const PageTableEntry = packed struct {
     dirty: bool = false,
     huge_page: bool = false,
     global: bool,
-    available_2: u3 = undefined,
+    available_2: u3 = 0,
     physical_page_number: PageNum,
     reserved: u12 = 0,
-    available_1: u11 = undefined,
+    available_1: u11 = 0,
     execute_disabled: bool,
 
     /// Page table entry that is "empty", i.e. not present

@@ -104,7 +104,9 @@ export fn main() callconv(.{
         kdebug.halt();
     };
 
-    // startupAps();
+    startupAps() catch |err| {
+        std.log.err("failed to start APs: {}", .{err});
+    };
 
     global_font = ozlib.font.Psf1Font.parse(os.heap.page_allocator, &font_data) catch |err| {
         std.log.err("failed to load font: {}", .{err});
@@ -208,6 +210,9 @@ fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt)
     log.info("start", .{});
 
     var bootstrap_page_alloc = ozlib.alloc.BootinfoMMapPageAllocator.init(mem_map);
+    // Reserve low memory pages for e.g. AP trampoline code
+    // TODO: Figure out a better way to do this. Maybe start bootinfo allocator from some offset?
+    _ = bootstrap_page_alloc.allocPages(256);
     kernel_heap_state.heap_region = .init(
         pml4,
         bootstrap_page_alloc.allocator(),
@@ -294,7 +299,7 @@ fn setupInterrupts() !void {
         0,
         0xFFFFF,
         .{ .privilege_level = 0, .writeable = true },
-        .{ .granularity = .pages, .protected_mode_32_bit = true, .long_mode = false },
+        .{ .granularity = .pages, .protected_mode_32_bit = false, .long_mode = true },
     ));
     gdt[user_code_seg / 8] = @bitCast(int.SegmentDescriptor.initCode(
         0,
@@ -306,7 +311,7 @@ fn setupInterrupts() !void {
         0,
         0xFFFFF,
         .{ .privilege_level = 3, .writeable = true },
-        .{ .granularity = .pages, .protected_mode_32_bit = true, .long_mode = false },
+        .{ .granularity = .pages, .protected_mode_32_bit = false, .long_mode = false },
     ));
 
     const tss_entry: *int.LongModeSegmentDescriptor = @ptrCast(@alignCast(&gdt[tss_seg / 8]));
@@ -348,13 +353,13 @@ fn setupInterrupts() !void {
     // 0x16-0x1f reserved
 
     // Add in fallback handlers that send EoI to the PIC to avoid lock-ups
-    inline for (0x20..0x30, 0..) |vector, irq| {
-        idt[vector] = makeFallbackPicHandler(int_selector, vector, irq);
+    inline for (0..15, int.pic.IRQ_OFFSET..) |pic_irq, vector| {
+        idt[vector] = makeFallbackPicHandler(int_selector, vector, pic_irq);
     }
 
     // Custom handlers
-    idt[0x20 + keyboard.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&keyboardHandler), int_selector, 0, .int, 0);
-    idt[0x20 + mouse.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&mouseHandler), int_selector, 0, .int, 0);
+    idt[int.pic.IRQ_OFFSET + keyboard.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&keyboardHandler), int_selector, 0, .int, 0);
+    idt[int.pic.IRQ_OFFSET + mouse.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&mouseHandler), int_selector, 0, .int, 0);
     idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
 
     int.disableInterrupts();
@@ -539,64 +544,8 @@ fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vecto
 //     );
 // }
 
-fn getBspid() u16 {
-    var cpuid_ebx: u32 = undefined;
-    asm (
-        \\mov $1, %%eax
-        \\cpuid
-        : [bspid] "={ebx}" (cpuid_ebx),
-        :
-        : .{ .eax = true, .ecx = true, .edx = true });
-    return @intCast(cpuid_ebx >> 24);
-}
-
-const ProcessorInfo = struct {
-    processor_uid: u8,
-    local_apic_id: u8,
-};
-
-fn getNumcoresAcpi(rsdp: *const ozlib.acpi.Rsdp) ?u16 {
-    if (!rsdp.valid()) {
-        std.log.warn("RSDP invalid: {}", .{rsdp});
-        return null;
-    }
-
-    const xsdt = rsdp.xsdtPtr();
-    if (!xsdt.header.valid(ozlib.acpi.Xsdt.SIGNATURE)) {
-        std.log.warn("XSDT invalid: {}", .{xsdt});
-        return null;
-    }
-
-    var numcores: u8 = 0;
-    const madt: *const ozlib.acpi.Madt = xsdt.findTypedTable(ozlib.acpi.Madt) orelse return null;
-    // Can use this directly since pages are identity-mapped
-    var madt_iter = madt.iterator();
-    while (madt_iter.next()) |controller| {
-        std.log.debug("found controller: {}", .{controller});
-        switch (controller) {
-            .local_apic => {
-                numcores += 1;
-            },
-            else => {},
-        }
-    }
-    return numcores;
-}
-
-fn getNumcores(acpi_ptr: ?*anyopaque, mps_ptr: ?*anyopaque) u16 {
-    if (acpi_ptr) |rsdp| {
-        if (!std.mem.isAligned(@intFromPtr(rsdp), @alignOf(ozlib.acpi.Rsdp))) {
-            std.debug.panic("bad RSDP alignment: {*}", .{rsdp});
-        }
-        if (getNumcoresAcpi(@ptrCast(@alignCast(rsdp)))) |n| return n;
-    }
-    _ = mps_ptr;
-    // TODO: Support other methods
-    return 1;
-}
-
 export fn apMain() callconv(.{
-    .x86_64_win = .{
+    .x86_64_sysv = .{
         // Normal stack alignment is 16 bytes before a `call` instruction. Since
         // code entering here isn't _called_, there is no return address on the
         // stack, which behaves like the stack was only 8-byte aligned before
@@ -619,26 +568,59 @@ inline fn pause() void {
     asm volatile ("pause" ::: .{ .memory = true });
 }
 
-const Pit = struct {
+const pit = struct {
+    const freq_hz = 1_193_182;
+    pub const max_period_microseconds = std.math.maxInt(u16) * 1_000_000 / freq_hz;
+
     const CHANNEL0_PORT = 0x40;
     const CHANNEL1_PORT = 0x41;
     const CHANNEL2_PORT = 0x42;
     const CONTORL_PORT = 0x43;
 
+    const inb = ozlib.port_io.inbComptimePort;
+    const outb = ozlib.port_io.outbComptimePort;
+
+    fn ticksFromMicroseconds(microseconds: u16) u16 {
+        std.debug.assert(microseconds <= max_period_microseconds);
+        // TODO: Always round up?
+        // TODO: 0 actually means 65536
+        return @intCast(freq_hz * @as(u64, microseconds) / 1_000_000);
+    }
+
+    pub fn configureOneshot(microseconds: u16) void {
+        const reset = ticksFromMicroseconds(microseconds);
+        outb(CONTORL_PORT, @bitCast(Control{ .mode = .oneshot, .rw = .lsb_msb, .index = 0 }));
+        outb(CHANNEL0_PORT, @truncate(reset));
+        outb(CHANNEL0_PORT, @truncate(reset >> 8));
+    }
+
+    fn readStatus() ReadBackStatus {
+        outb(CONTORL_PORT, @bitCast(ReadBackCommand{
+            .counter0 = true,
+            .status_latch_disable = false,
+        }));
+        const status: ReadBackStatus = @bitCast(inb(CHANNEL0_PORT));
+        return status;
+    }
+
+    pub fn isDone() bool {
+        return readStatus().output;
+    }
+
     const Control = packed struct(u8) {
-        bcd: bool,
+        bcd: bool = false,
         mode: Mode,
         rw: RwMode,
         index: u2,
     };
     const Mode = enum(u3) {
-        terminal = 0b000,
-        oneshot = 0b001,
+        oneshot = 0b000,
+        hw_oneshot = 0b001,
         rate = 0b010,
         rate_alt = 0b110,
         square = 0b011,
         square_alt = 0b111,
-        sw_strobe = 0b100,
+        strobe = 0b100,
         hw_strobe = 0b101,
     };
     const RwMode = enum(u2) {
@@ -650,12 +632,13 @@ const Pit = struct {
 
     const ReadBackCommand = packed struct(u8) {
         _reserved1: u1 = 0,
-        counter0: bool,
-        counter1: bool,
-        counter2: bool,
-        status_latch_disable: bool,
-        counter_latch_disable: bool,
-        _reserved2: u2 = 3,
+        counter0: bool = false,
+        counter1: bool = false,
+        counter2: bool = false,
+        status_latch_disable: bool = true,
+        counter_latch_disable: bool = true,
+        // Has to be 11
+        _fixed_index: u2 = 0b11,
     };
     const ReadBackStatus = packed struct(u8) {
         bcd: bool,
@@ -666,23 +649,40 @@ const Pit = struct {
     };
 };
 
+fn shortSleep(micros: u16) void {
+    pit.configureOneshot(micros);
+    while (!pit.isDone()) {
+        pause();
+    }
+}
+
 fn sleep(micros: usize) void {
-    _ = micros;
-    // uefi.system_table.boot_services.?.stall(micros) catch {};
+    var remaining = micros;
+    while (remaining > pit.max_period_microseconds) {
+        shortSleep(pit.max_period_microseconds);
+        remaining -= pit.max_period_microseconds;
+    }
+    shortSleep(@intCast(remaining));
 }
 
 var apReady: std.atomic.Value(bool) = .init(false);
 var bspDone: std.atomic.Value(bool) = .init(false);
 
-extern const ap_trampoline: u8;
-extern const ap_trampoline_end: u8;
+extern const _ap_trampoline: u8;
+extern const _ap_trampoline_end: u8;
+
+/// CR3 has to have a 32-bit address
+extern var _ap_arg_cr3: u32;
+extern var _ap_arg_gdtr: int.DescriptorTableRegister;
+extern var _ap_arg_sp: u64;
 
 const ap_trampoline_load_addr = 0x8000;
 
 const LocalApic = ozlib.interrupt.apic.Local;
+// Initialize with default address, can be overridden later
+var local_apic: *volatile LocalApic = @ptrFromInt(0xFEE0_0000);
 
-fn startupAps() void {
-    var local_apic_ptr: ?*volatile LocalApic = null;
+fn startupAps() !void {
     var proc_infos: [255]?*align(1) const ozlib.acpi.Madt.LocalApic = .{null} ** 255;
 
     const rsdp: *const ozlib.acpi.Rsdp = @ptrFromInt(bootinfo.acpi_ptr);
@@ -700,131 +700,128 @@ fn startupAps() void {
 
     const madt: *const ozlib.acpi.Madt = xsdt.findTypedTable(ozlib.acpi.Madt) orelse return;
     // Can use this directly since pages are identity-mapped
-    local_apic_ptr = @ptrFromInt(madt.local_controller_addr);
+    local_apic = @ptrFromInt(madt.local_controller_addr);
     var madt_iter = madt.iterator();
     var numcores: usize = 0;
     while (madt_iter.next()) |controller| {
         std.log.debug("found controller: {}", .{controller});
         switch (controller) {
-            .local_apic => |local_apic| {
-                std.log.debug("found LAPIC: {*}={}", .{ local_apic, local_apic.* });
-                proc_infos[numcores] = local_apic;
+            .local_apic => |local| {
+                std.log.debug("found LAPIC: {*}={}", .{ local, local.* });
+                proc_infos[numcores] = local;
                 numcores += 1;
             },
             .local_apic_address_override => |override| {
-                local_apic_ptr = @ptrFromInt(override.addr);
+                local_apic = @ptrFromInt(override.addr);
             },
             else => {},
         }
     }
 
+    // 1 page for each AP
+    // TODO: Is more required?
+    // TODO: Map these stacks to sepcial locations?
+    // TODO: Map each stack to the same location and provide each AP with a different page table?
+    // TODO: Don't allocate stack page for BSP?
+    const ap_stack_pages = try os.heap.page_allocator.alignedAlloc([4096]u8, .fromByteUnits(4096), numcores);
+
     // TODO: Check mem map to make sure this is free (or dynamically allocate it)
-    const ap_trampoline_page: *[4096]u8 align(4096) = @ptrCast(ap_trampoline_load_addr);
+    const ap_trampoline_page: *[4096]u8 align(4096) = @ptrFromInt(ap_trampoline_load_addr);
     std.log.debug("ap_load_addr: {*}", .{ap_trampoline_page});
-    // TODO: Compute ap_trampoline size and only copy that much
-    @memcpy(ap_trampoline_page, @as([*]const u8, @ptrCast(&ap_trampoline))[0..4096]);
+    const ap_trampoline_len = @intFromPtr(&_ap_trampoline_end) - @intFromPtr(&_ap_trampoline);
+    @memcpy(ap_trampoline_page[0..ap_trampoline_len], @as([*]const u8, @ptrCast(&_ap_trampoline)));
 
-    const ap_cr3: *u64 = @ptrFromInt(0x80C0);
-    ap_cr3.* = ozlib.paging.getRootPageTable();
-    // const ap_cs: *u32 = @ptrFromInt(0x80CC);
-    // const ap_ds: *u32 = @ptrFromInt(0x80D0);
-    asm volatile (
-        \\movl %%cs, %%eax
-        \\movl %%eax, 0x80CC
-        \\movl %%ds, %%eax
-        \\movl %%eax, 0x80D0
-        ::: .{ .memory = true });
-    const ap_gdtr: *ozlib.interrupt.DescriptorTableRegister = @ptrFromInt(0x80E0);
-    ap_gdtr.* = ozlib.interrupt.getGdtr();
-    const ap_main: *u64 = @ptrFromInt(0x80D8);
-    ap_main.* = @intFromPtr(&apMain);
+    const pml4_addr = ozlib.paging.getRootPageTable();
+    // TODO: Ensure this when allocating
+    std.debug.assert(pml4_addr <= std.math.maxInt(u32));
+    _ap_arg_cr3 = @truncate(pml4_addr);
+    _ap_arg_gdtr = int.getGdtr();
 
-    if (local_apic_ptr) |lapic| {
-        lapic.set(.local_dest, LocalApic.Destination{ .target = 1 });
-        lapic.set(.dest_fmt, LocalApic.DestinationFormat{ .model = .flat });
-        lapic.set(.spurious, LocalApic.SpuriousVector{ .vector = 0xFF, .enable = true });
-        lapic.set(.tpr, 0);
-        const bsp_apic_id = lapic.getId();
-        std.log.debug("BSP LAPIC ID: {}", .{bsp_apic_id});
+    local_apic.set(.local_dest, LocalApic.Destination{ .target = 1 });
+    local_apic.set(.dest_fmt, LocalApic.DestinationFormat{ .model = .flat });
+    local_apic.set(.spurious, LocalApic.SpuriousVector{ .vector = 0xFF, .enable = true });
+    local_apic.set(.tpr, 0);
+    const bsp_apic_id = local_apic.getId();
+    std.log.info("BSP LAPIC ID: {}", .{bsp_apic_id});
 
-        // TODO: For APS
-        //
-        // enable Local APIC
-        // *((volatile uint32_t*)(lapic_addr + 0x0F0)) = *((volatile uint32_t*)(lapic_addr + 0x0F0)) | 0x100;
-        // core_num = lapic_ids[*((volatile uint32_t*)(lapic_addr + 0x20)) >> 24];
+    // TODO: For APS
+    //
+    // enable Local APIC
+    // *((volatile uint32_t*)(lapic_addr + 0x0F0)) = *((volatile uint32_t*)(lapic_addr + 0x0F0)) | 0x100;
+    // core_num = lapic_ids[*((volatile uint32_t*)(lapic_addr + 0x20)) >> 24];
 
-        std.log.debug("starting {} APs", .{numcores - 1});
-        var successfulStarted: u8 = 0;
-        for (0..numcores) |proc_index| {
-            const info = proc_infos[proc_index] orelse continue;
-            const lapic_id = info.id;
-            const proc_uid = info.processor_uid;
-            if (lapic_id == bsp_apic_id) continue;
+    std.log.info("starting {} APs", .{numcores - 1});
+    var successfulStarted: u8 = 0;
+    for (0..numcores) |proc_index| {
+        const info = proc_infos[proc_index] orelse continue;
+        const lapic_id = info.id;
+        const proc_uid = info.processor_uid;
+        if (lapic_id == bsp_apic_id) continue;
 
-            apReady.store(false, .release);
-            std.log.debug("starting AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+        const stack_page = &ap_stack_pages[proc_index];
+        _ap_arg_sp = @intFromPtr(stack_page) + stack_page.len;
 
-            std.log.debug("sending INIT IPI", .{});
-            lapic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init });
+        apReady.store(false, .release);
+        std.log.info("starting AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+
+        std.log.debug("sending INIT IPI", .{});
+        local_apic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init });
+        // TOOD: Poll more frequently
+        sleep(LocalApic.ipi_delivery_timeout_us);
+        if (local_apic.ipiPending()) {
+            std.log.err("failed to send INIT IPI: {}", .{local_apic.getErrorStatus()});
+            continue;
+        }
+        std.log.debug("sent INIT IPI", .{});
+        sleep(1);
+
+        std.log.debug("sending INIT IPI de-assert", .{});
+        local_apic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init, .level_assert = false, .level_triggered = true });
+        // TOOD: Poll more frequently
+        sleep(LocalApic.ipi_delivery_timeout_us);
+        if (local_apic.ipiPending()) {
+            std.log.err("failed to send INIT de-assert IPI: {}", .{local_apic.getErrorStatus()});
+            continue;
+        }
+        std.log.debug("sent INIT IPI de-assert", .{});
+        sleep(10_000);
+
+        std.log.debug("sending STARTUP IPI 1", .{});
+        const startupVector: u8 = @intCast(ap_trampoline_load_addr / 4096);
+        local_apic.sendIpi(lapic_id, .{ .vector = startupVector, .delivery_mode = .startup });
+        // TOOD: Poll more frequently
+        sleep(LocalApic.ipi_delivery_timeout_us);
+        if (local_apic.ipiPending()) {
+            std.log.err("failed to send STARTUP IPI 1: {}", .{local_apic.getErrorStatus()});
+            continue;
+        }
+        std.log.debug("sent STARTUP IPI 1", .{});
+        // sleep(200);
+        sleep(1000);
+
+        std.log.debug("checking apDone", .{});
+        if (!apReady.load(.acquire)) {
+            std.log.debug("sending STARTUP IPI 2", .{});
+            local_apic.sendIpi(lapic_id, .{ .vector = startupVector, .delivery_mode = .startup });
             // TOOD: Poll more frequently
             sleep(LocalApic.ipi_delivery_timeout_us);
-            if (lapic.ipiPending()) {
-                std.log.err("failed to send INIT IPI: {}", .{lapic.getErrorStatus()});
+            if (local_apic.ipiPending()) {
+                std.log.err("failed to send STARTUP IPI 2: {}", .{local_apic.getErrorStatus()});
                 continue;
             }
-            std.log.debug("sent INIT IPI", .{});
-            sleep(1);
-
-            std.log.debug("sending INIT IPI de-assert", .{});
-            lapic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init, .level_assert = false, .level_triggered = true });
-            // TOOD: Poll more frequently
-            sleep(LocalApic.ipi_delivery_timeout_us);
-            if (lapic.ipiPending()) {
-                std.log.err("failed to send INIT de-assert IPI: {}", .{lapic.getErrorStatus()});
-                continue;
-            }
-            std.log.debug("sent INIT IPI de-assert", .{});
-            sleep(10_000);
-
-            std.log.debug("sending STARTUP IPI 1", .{});
-            const startupVector: u8 = @intCast(ap_trampoline_load_addr / 4096);
-            lapic.sendIpi(lapic_id, .{ .vector = startupVector, .delivery_mode = .startup });
-            // TOOD: Poll more frequently
-            sleep(LocalApic.ipi_delivery_timeout_us);
-            if (lapic.ipiPending()) {
-                std.log.err("failed to send STARTUP IPI 1: {}", .{lapic.getErrorStatus()});
-                continue;
-            }
-            std.log.debug("sent STARTUP IPI 1", .{});
+            std.log.debug("sent STARTUP IPI 2", .{});
             // sleep(200);
-            sleep(1000);
 
+            sleep(1_000_000);
             std.log.debug("checking apDone", .{});
             if (!apReady.load(.acquire)) {
-                std.log.debug("sending STARTUP IPI 2", .{});
-                lapic.sendIpi(lapic_id, .{ .vector = startupVector, .delivery_mode = .startup });
-                // TOOD: Poll more frequently
-                sleep(LocalApic.ipi_delivery_timeout_us);
-                if (lapic.ipiPending()) {
-                    std.log.err("failed to send STARTUP IPI 2: {}", .{lapic.getErrorStatus()});
-                    continue;
-                }
-                std.log.debug("sent STARTUP IPI 2", .{});
-                // sleep(200);
-
-                sleep(1_000_000);
-                std.log.debug("checking apDone", .{});
-                if (!apReady.load(.acquire)) {
-                    std.log.err("failed to start AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
-                    continue;
-                }
+                std.log.err("failed to start AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+                continue;
             }
-
-            std.log.debug("started AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
-            successfulStarted += 1;
         }
-        std.log.debug("successfully started {} APs", .{successfulStarted});
-    } else {
-        std.log.warn("LAPIC addr not found", .{});
+
+        std.log.debug("started AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+        successfulStarted += 1;
     }
+    std.log.debug("successfully started {} APs", .{successfulStarted});
 }

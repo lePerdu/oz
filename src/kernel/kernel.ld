@@ -3,48 +3,40 @@ ENTRY(_start)
 fb = 0xFFFFFFFFFC000000;
 bootinfo = 0xFFFFFFFFFFE00000;
 
+PHDRS {
+    text PT_LOAD FLAGS(5);
+    rodata PT_LOAD FLAGS(4);
+    ap_trampoline PT_LOAD FLAGS(4);
+    data PT_LOAD FLAGS(6);
+}
+
 SECTIONS {
     . = 0xFFFFFFFFFFE02000;
     _kernel_start = .;
 
-    .text.start : {
-        _kernel_startup_start = .;
-        *(.text.start);
-        _kernel_startup_end = .;
-    }
     .text : {
-        _kernel_text_start = .;
+        *(.text.start);
         *(.text*);
-        _kernel_text_end = .;
-    }
+    } :text
 
-    .rodata : {
-        _kernel_rodata_start = .;
-        *(.rodata*);
-        _kernel_rodata_end = .;
-    }
-    .eh_frame : {
-        _kernel_eh_frame_start = .;
-        *(.eh_frame);
-        _kernel_eh_frame_end = .;
-    }
-    .eh_frame_hdr : {
-        _kernel_eh_frame_hdr_start = .;
-        *(.eh_frame_hdr);
-        _kernel_eh_frame_hdr_end = .;
-    }
+    .rodata : ALIGN(4096) { *(.rodata*); } :rodata
+    .eh_frame : { *(.eh_frame); }
+    .eh_frame_hdr : { *(.eh_frame_hdr); }
 
-    .data : {
-        _kernel_data_start = .;
+    .data : ALIGN(4096) {
         *(.data*);
-        _kernel_data_end = .;
-
-        /* TODO: Put .bss in .bss section once the loader supports ELF */
-        _kernel_bss_start = .;
         *(.bss*);
         *(COMMON);
-        _kernel_bss_end = .;
-    }
+    } :data
+    .got : { *(.got); }
+
+    /* TODO: Figure out how to move this next to .rodata (since it's also read-only) */
+    _ap_trampoline = .;
+    .ap_trampoline 0x8000 : AT(_ap_trampoline) ALIGN(4096) {
+        *(.ap_trampoline);
+    } :ap_trampoline
+    . = _ap_trampoline + SIZEOF(.ap_trampoline);
+    _ap_trampoline_end = .;
 
     _kernel_end = .;
 }

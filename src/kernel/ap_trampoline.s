@@ -1,116 +1,103 @@
-/*
- * x86_64-efi/smp.S
- *
- * Copyright (C) 2017 - 2021 bzt (bztsrc@gitlab)
- *
- * Permission is hereby granted, free of charge, to any person
- * obtaining a copy of this software and associated documentation
- * files (the "Software"), to deal in the Software without
- * restriction, including without limitation the rights to use, copy,
- * modify, merge, publish, distribute, sublicense, and/or sell copies
- * of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
- * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
- * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- *
- * This file is part of the BOOTBOOT Protocol package.
- * @brief SMP initialization code.
- *
- */
+.section .ap_trampoline, "a", @progbits
 
-.globl ap_trampoline
-.globl ap_trampoline_end
+.set CR0_PE, 1
+.set CR0_MP, 1 << 1
+.set CR0_NE, 1 << 5
+.set CR0_WP, 1 << 16
+.set CR0_NW, 1 << 29
+.set CR0_CD, 1 << 30
+.set CR0_PG, 1 << 31
 
-/*****************************************************************************
- * things to do on the APs                                                   *
- *****************************************************************************/
-    .balign 128
-    .code16
-    /* this code will be relocated to 0x8000 - 0x8100 */
+.set CR4_PAE, 1 << 5
+.set CR4_OSFXSR, 1 << 9
+.set CR4_OSXMMEXCPT, 1<<10
+
+.set IA32_EFER, 0xC0000080
+.set EFER_LME, 1 << 8
+.set EFER_NXE, 1 << 11
+
 ap_trampoline:
+    .code16
     cli
-    cld
-    # mov '!', %al
-    # outb %al, $0xE9
-    # mov '\n', %al
-    # outb %al, $0xE9
-    ljmp    $0, $0x8040
-    .balign 16
-    // prot mode GDT
-_L8010_GDT_table:
-    .long 0, 0
-    .long 0x0000FFFF, 0x00CF9A00    // flat code
-    .long 0x0000FFFF, 0x008F9200    // flat data
-    .long 0x00000068, 0x00CF8900    // tss, not used but required by VB's vt-x
-_L8030_GDT_value:
-    .word _L8030_GDT_value - _L8010_GDT_table - 1
-    .long 0x8010
-    .long 0, 0
-    .balign 64
-_L8040:
-    xorw    %ax, %ax
-    movw    %ax, %ds
-    lgdtl   0x8030
-    movl    %cr0, %eax
-    orl     $1, %eax
-    movl    %eax, %cr0
-    ljmp    $8, $0x8060
-    .balign 32
+    xor %ax, %ax
+    mov %ax, %ds
+    lgdt _gdtr
+    mov %cr0, %eax
+    or $CR0_PE, %eax
+    mov %eax, %cr0
+    ljmp $0x08, $_protected_mode
+
+_protected_mode:
     .code32
-_L8060:
-    movw    $16, %ax
-    movw    %ax, %ds
-    movw    %ax, %ss
-    movl    $0x368, %eax        // Set PAE, MCE, PGE; OSFXSR, OSXMMEXCPT (enable SSE)
-    movl    %eax, %cr4
-    movl    0x80C0, %eax        // let's hope it's in the first 4G...
-    movl    %eax, %cr3
-    movl    $0x0C0000080, %ecx  // EFR MSR
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %ss
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+
+    # TODO: Check cpuid before enabling SSE
+    # TODO: More thorough setting of CR* registers so they are the same between BSP and APs
+    mov %cr4, %eax
+    or $(CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT), %eax
+    mov %eax, %cr4
+
+    mov _ap_arg_cr3, %eax
+    mov %eax, %cr3
+
+    mov $IA32_EFER, %ecx
     rdmsr
-    orl     $0x100, %eax        // enable long mode
+    or $(EFER_LME | EFER_NXE), %eax
     wrmsr
-    movl    $0x0C0000011, %eax  // clear EM, MP (enable SSE) and WP
-    movl    %eax, %cr0
-    lgdtl   0x80E0
-    movl    $0x80C8, %esp       // we can't use "ljmp $8, $0x80A0", because we don't know cs
-    lret
-    .balign 32
+
+    mov %cr0, %eax
+    or $(CR0_PG | CR0_MP | CR0_WP | CR0_NE), %eax
+    and $(~CR0_CD & ~CR0_NW), %eax
+    mov %eax, %cr0
+
+    # Set CS
+    ljmpl $0x18, $_long_mode
+
+_long_mode:
     .code64
-_L80A0:
-    movl    0x80D0, %eax         // load long mode segments
-    movw    %ax, %ds
-    movw    %ax, %es
-    movw    %ax, %ss
-    movw    %ax, %fs
-    movw    %ax, %gs
-// some linkers (GNU ld) generates bad relocation record for this
-//    jmp     bootboot_startcode
-    movq    0x80D8, %rax
-    // in theory this could cause trouble, but it does not since all cores are executing the same
-    // code at this point, so it doesn't matter if one core is overwriting the same stack with the
-    // stack frame, because all are saving exactly the same stack frame to the same position
-    movl    $0x8800, %esp
-    jmp     *%rax
-    .balign 32
-_L80C0_cr3_value:
-    .long 0, 0
-    .long 0x80A0
-_L80CC_cs_value:
+    mov $0x20, %ax
+    mov %ax, %ds
+    mov %ax, %ss
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+
+    mov _ap_arg_sp, %rsp
+    # TODO: jmp apMain assemblers, but does it compile "correctly"
+    jmp apMain
+
+_gdtr:
+    .short _gdt_end - _gdt - 1
+    .long _gdt
+
+.align 16
+_gdt:
+.quad 0 /* Null */
+.quad 0x00cf9a000000ffff /* 4GB kernel code segment */
+.quad 0x00cf92000000ffff /* 4GB kernel data segment */
+.quad 0x00209a0000000000 /* 64-bit kernel code segment */
+.quad 0x0000920000000000 /* 64-bit kernel data segment */
+/* TODO: TSS? */
+_gdt_end:
+
+# "arguments" that need to be set by the BSP
+
+.align 8
+.global _ap_arg_sp
+_ap_arg_sp:
+    .quad 0
+
+.align 4
+.global _ap_arg_cr3
+_ap_arg_cr3:
     .long 0
-_L80D0_ds_value:
-    .long 0, 0
-_L80D8_bootboot_startcore:
-    .long 0, 0
-_L80E0_gdt_value:
-    .long 0, 0, 0, 0
-ap_trampoline_end:
+
+.global _ap_arg_gdtr
+_ap_arg_gdtr:
+    .short 0
+    .quad 0

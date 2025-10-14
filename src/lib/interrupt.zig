@@ -20,9 +20,9 @@ pub fn setInterrupts(enabled: bool) void {
     }
 }
 
-pub const DescriptorTableRegister = packed struct {
-    limit: u16,
-    base: u64,
+pub const DescriptorTableRegister = extern struct {
+    limit: u16 align(1),
+    base: u64 align(1),
 };
 
 pub fn getGdtr() DescriptorTableRegister {
@@ -85,8 +85,7 @@ pub fn setCodeSegmentRegister(selector: SegmentSelector) void {
 }
 
 pub const pic = struct {
-    pub const MASTER_OFFSET = 0x20;
-    pub const SLAVE_OFFSET = MASTER_OFFSET + 8;
+    pub const IRQ_OFFSET = 0x20;
 
     const MASTER_COMMAND_PORT = 0x20;
     const MASTER_DATA_PORT = 0x21;
@@ -187,9 +186,9 @@ pub const pic = struct {
         ioWait();
         out(SLAVE_COMMAND_PORT, ICW1_INIT | ICW1_ICW4);
         ioWait();
-        out(MASTER_DATA_PORT, MASTER_OFFSET);
+        out(MASTER_DATA_PORT, IRQ_OFFSET);
         ioWait();
-        out(SLAVE_DATA_PORT, SLAVE_OFFSET);
+        out(SLAVE_DATA_PORT, IRQ_OFFSET + 8);
         ioWait();
         out(MASTER_DATA_PORT, 1 << CASCADE_IRQ);
         ioWait();
