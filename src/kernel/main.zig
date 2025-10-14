@@ -87,6 +87,15 @@ export fn main() callconv(.{
     std.log.info("Hello, kernel!", .{});
     std.log.info("Kernel size: {} B ({} KiB)", .{ getKernelSize(), getKernelSize() / 1024 });
 
+    collectProcessorInfo();
+
+    const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
+
+    setupKernelHeap(pml4, bootinfo.mmapEntries()) catch |err| {
+        std.log.err("failed setting up heap: {}", .{err});
+        kdebug.halt();
+    };
+
     // TODO: Figure out why interruts are coming in while configuring the PS/2 devices
     setupInterrupts() catch |err| {
         std.log.err("failed to setup GDT and IDT: {}", .{err});
@@ -96,13 +105,6 @@ export fn main() callconv(.{
 
     int.pic.configure();
     int.pic.setMask(0xFFFF);
-
-    const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
-
-    setupKernelHeap(pml4, bootinfo.mmapEntries()) catch |err| {
-        std.log.err("failed setting up heap: {}", .{err});
-        kdebug.halt();
-    };
 
     startupAps() catch |err| {
         std.log.err("failed to start APs: {}", .{err});
@@ -205,14 +207,16 @@ pub const kernel_heap_vma_start: paging.VirtualAddress = 0xFFFF_C000_0000_0000;
 pub const kernel_heap_vma_end: paging.VirtualAddress = ozlib.boot.mmio_start;
 pub const kernel_heap_vma_len: usize = kernel_heap_vma_end - kernel_heap_vma_start;
 
+/// Reserve low memory pages for e.g. AP trampoline code
+/// TODO: Figure out a better way to do this. Maybe start bootinfo allocator from some offset?
+const early_kernel_reserved_page_count = 256;
+
 fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt) !void {
     const log = std.log.scoped(.setupKernelHeap);
     log.info("start", .{});
 
     var bootstrap_page_alloc = ozlib.alloc.BootinfoMMapPageAllocator.init(mem_map);
-    // Reserve low memory pages for e.g. AP trampoline code
-    // TODO: Figure out a better way to do this. Maybe start bootinfo allocator from some offset?
-    _ = bootstrap_page_alloc.allocPages(256);
+    _ = bootstrap_page_alloc.allocPages(early_kernel_reserved_page_count);
     kernel_heap_state.heap_region = .init(
         pml4,
         bootstrap_page_alloc.allocator(),
@@ -228,7 +232,8 @@ fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt)
     var bitmap = ozlib.alloc.PageBitmap.init(bitmap_data, page_count);
     // Mark space used for bitmap allocations
     log.debug("marking bootstrap allocator allocations as used", .{});
-    bitmap.markRangeUsed(0, bootstrap_page_alloc.getNextUnallocatedPage());
+    bitmap.markRangeUsed(0, early_kernel_reserved_page_count);
+    bitmap.markRangeUsed(early_kernel_reserved_page_count, bootstrap_page_alloc.getNextUnallocatedPage());
     log.debug("marking pages from memory map as used", .{});
     markInitialUsedPages(&bitmap, mem_map);
     log.debug("done", .{});
@@ -280,13 +285,51 @@ const kernel_code_seg = 0x08;
 const kernel_data_seg = 0x10;
 const user_code_seg = 0x18;
 const user_data_seg = 0x20;
-const tss_seg = 0x28;
-var gdt: [7]u64 = undefined;
+const tss_offset_seg = 0x28;
+const tss_offset_index = tss_offset_seg / @sizeOf(u64);
 
-var tss: int.TaskStateSegment = undefined;
+/// Statically-allocated IDT
 var idt = [_]int.InterruptDescriptor{.empty} ** 256;
 
+// GDT and TSSs are allocated dynamically since the number of them depends on how many processors there are
+
+// TODO: Avoid this
+/// Dummy GDT table to initialize `gdt`
+var dummy_gdt: [1]u64 = .{0};
+var gdt: []u64 = &dummy_gdt;
+// TODO: This may have to change if IOBP is used, since possibly many IOBP objects will need to be stored next to each TSS
+var tss_list: []int.TaskStateSegment = &.{};
+
+/// Configure GDT, TR, and IDT. Has to be done per-processor
+fn configureSystemTables() void {
+    int.disableInterrupts();
+
+    const gdt_limit: u16 = @intCast(gdt.len * @sizeOf(@TypeOf(gdt[0])) - 1);
+    int.setGdtr(@intFromPtr(gdt.ptr), gdt_limit);
+
+    const proc_index = proc_index_from_apic_id[local_apic.getId()].?;
+    int.setTr(int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = tss_offset_index + proc_index * 2 });
+
+    const idt_limit: u16 = @sizeOf(@TypeOf(idt)) - 1;
+    int.setIdtr(@intFromPtr(&idt), idt_limit);
+
+    const kernel_data_selector = int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_data_seg / 8 };
+    int.setDataSegmentRegister(.ds, kernel_data_selector);
+    int.setDataSegmentRegister(.es, kernel_data_selector);
+    int.setDataSegmentRegister(.fs, kernel_data_selector);
+    int.setDataSegmentRegister(.gs, kernel_data_selector);
+    int.setDataSegmentRegister(.ss, kernel_data_selector);
+
+    int.setCodeSegmentRegister(int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_code_seg / 8 });
+
+    int.nmiEnable();
+    int.enableInterrupts();
+}
+
 fn setupInterrupts() !void {
+    gdt = try os.heap.page_allocator.alloc(u64, tss_offset_index + 2 * @as(usize, numcores));
+    tss_list = try os.heap.page_allocator.alloc(int.TaskStateSegment, numcores);
+
     gdt[0] = @bitCast(int.SegmentDescriptor.null_descriptor);
 
     gdt[kernel_code_seg / 8] = @bitCast(int.SegmentDescriptor.initCode(
@@ -314,18 +357,20 @@ fn setupInterrupts() !void {
         .{ .granularity = .pages, .protected_mode_32_bit = false, .long_mode = false },
     ));
 
-    const tss_entry: *int.LongModeSegmentDescriptor = @ptrCast(@alignCast(&gdt[tss_seg / 8]));
-    // TSS
-    // TODO: Figure out what this is for
-    tss_entry.* = @bitCast(int.LongModeSegmentDescriptor.init(
-        @intFromPtr(&tss),
-        @sizeOf(@TypeOf(tss)),
-        .{ .privilege_level = 0, .system_type = .tss_64_available },
-        .{ .granularity = .bytes, .protected_mode_32_bit = false, .long_mode = false },
-    ));
+    for (tss_list, 0..) |*tss, tss_index| {
+        // Max offset so that it's invalid
+        tss.iopb = @sizeOf(@TypeOf(tss.*));
+        // TODO: Fill in other TSS fields
 
-    // Max offset so that it's invalid
-    tss.iopb = 0xFFFF;
+        const tss_bits: u128 = @bitCast(int.LongModeSegmentDescriptor.init(
+            @intFromPtr(tss),
+            @sizeOf(@TypeOf(tss.*)) - 1,
+            .{ .privilege_level = 0, .system_type = .tss_64_available },
+            .{ .granularity = .bytes, .protected_mode_32_bit = false, .long_mode = false },
+        ));
+        gdt[tss_offset_index + tss_index * 2] = @truncate(tss_bits);
+        gdt[tss_offset_index + tss_index * 2 + 1] = @truncate(tss_bits >> 64);
+    }
 
     const int_selector = int.SegmentSelector{ .privilege_level = 0, .table = .gdt, .index = kernel_code_seg / 8 };
     idt[0x00] = makeExceptionHandler(int_selector, "divide error", 0x00, .trap);
@@ -358,38 +403,27 @@ fn setupInterrupts() !void {
     }
 
     // Custom handlers
+    // TODO: Handle keyboard/mouse with I/O APIC
     idt[int.pic.IRQ_OFFSET + keyboard.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&keyboardHandler), int_selector, 0, .int, 0);
     idt[int.pic.IRQ_OFFSET + mouse.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&mouseHandler), int_selector, 0, .int, 0);
     idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
 
-    int.disableInterrupts();
-    std.log.info("interrupts disabled", .{});
+    idt[LocalApic.SPURIOUS_VECTOR] = int.InterruptDescriptor.init(@intFromPtr(&apicSpuriousIntHandler), int_selector, 0, .int, 0);
 
-    const gdt_limit = gdt.len * @sizeOf(@TypeOf(gdt[0])) - 1;
-    std.log.info("setup GDT: offset={*} limit={}", .{ &gdt, gdt_limit });
-    int.setGdtr(@intFromPtr(&gdt), gdt_limit);
-
-    const idt_limit = @sizeOf(@TypeOf(idt)) - 1;
-    std.log.info("setup IDT: offset={*} limit={}", .{ &idt, idt_limit });
-    int.setIdtr(@intFromPtr(&idt), idt_limit);
-
-    const kernel_data_selector = int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_data_seg / 8 };
-    int.setDataSegmentRegister(.ds, kernel_data_selector);
-    int.setDataSegmentRegister(.es, kernel_data_selector);
-    int.setDataSegmentRegister(.fs, kernel_data_selector);
-    int.setDataSegmentRegister(.gs, kernel_data_selector);
-    int.setDataSegmentRegister(.ss, kernel_data_selector);
-
-    int.setCodeSegmentRegister(int.SegmentSelector{ .table = .gdt, .privilege_level = 0, .index = kernel_code_seg / 8 });
-
-    int.nmiEnable();
-
-    int.enableInterrupts();
-    std.log.info("interrupts enabled", .{});
+    configureSystemTables();
+    std.log.info("interrupts configured and enabled", .{});
 }
 
 fn int32Handler() callconv(.{ .x86_64_interrupt = .{} }) void {
     std.log.info("int 0x32!", .{});
+}
+
+fn picSpuriousIntHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+    std.log.info("PIC spurious interrupt!", .{});
+}
+
+fn apicSpuriousIntHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+    std.log.info("APIC spurious interrupt!", .{});
 }
 
 var cursor_x: usize = 0;
@@ -556,6 +590,8 @@ export fn apMain() callconv(.{
 }) void {
     apReady.store(true, .release);
     std.log.info("AP started!", .{});
+    configureLocalApic();
+    configureSystemTables();
     halt();
 }
 
@@ -682,9 +718,15 @@ const LocalApic = ozlib.interrupt.apic.Local;
 // Initialize with default address, can be overridden later
 var local_apic: *volatile LocalApic = @ptrFromInt(0xFEE0_0000);
 
-fn startupAps() !void {
-    var proc_infos: [255]?*align(1) const ozlib.acpi.Madt.LocalApic = .{null} ** 255;
+// Mappings between APIC IDs (which may be sparse) to "processor indices" from 0..numcores
+// TODO: Encapsulate this info better?
 
+// TODO: Are IDs guaranteed to be contiguous? Is it possible to make them contiguous? If so, these mappings aren't needed
+var numcores: u8 = 0;
+var proc_index_from_apic_id: [256]?u8 = .{null} ** 256;
+var apic_id_from_proc_index: [256]?u8 = .{null} ** 256;
+
+fn collectProcessorInfo() void {
     const rsdp: *const ozlib.acpi.Rsdp = @ptrFromInt(bootinfo.acpi_ptr);
 
     if (!rsdp.valid()) {
@@ -702,14 +744,18 @@ fn startupAps() !void {
     // Can use this directly since pages are identity-mapped
     local_apic = @ptrFromInt(madt.local_controller_addr);
     var madt_iter = madt.iterator();
-    var numcores: usize = 0;
     while (madt_iter.next()) |controller| {
         std.log.debug("found controller: {}", .{controller});
         switch (controller) {
             .local_apic => |local| {
-                std.log.debug("found LAPIC: {*}={}", .{ local, local.* });
-                proc_infos[numcores] = local;
-                numcores += 1;
+                if (local.flags.enabled) {
+                    std.log.debug("found LAPIC: {*}={}", .{ local, local.* });
+                    apic_id_from_proc_index[numcores] = local.id;
+                    proc_index_from_apic_id[local.id] = numcores;
+                    numcores += 1;
+                } else {
+                    std.log.warn("found disabled LAPIC: {*}={}", .{ local, local.* });
+                }
             },
             .local_apic_address_override => |override| {
                 local_apic = @ptrFromInt(override.addr);
@@ -717,7 +763,18 @@ fn startupAps() !void {
             else => {},
         }
     }
+}
 
+/// Configure Local APIC (has to be done on each processor)
+fn configureLocalApic() void {
+    // TODO: Figure out what all these are and if they are necessary
+    local_apic.set(.local_dest, LocalApic.Destination{ .target = 1 });
+    local_apic.set(.dest_fmt, LocalApic.DestinationFormat{ .model = .flat });
+    local_apic.set(.spurious, LocalApic.SpuriousVector{ .vector = LocalApic.SPURIOUS_VECTOR, .enable = true });
+    local_apic.set(.tpr, 0);
+}
+
+fn startupAps() !void {
     // 1 page for each AP
     // TODO: Is more required?
     // TODO: Map these stacks to sepcial locations?
@@ -737,32 +794,22 @@ fn startupAps() !void {
     _ap_arg_cr3 = @truncate(pml4_addr);
     _ap_arg_gdtr = int.getGdtr();
 
-    local_apic.set(.local_dest, LocalApic.Destination{ .target = 1 });
-    local_apic.set(.dest_fmt, LocalApic.DestinationFormat{ .model = .flat });
-    local_apic.set(.spurious, LocalApic.SpuriousVector{ .vector = 0xFF, .enable = true });
-    local_apic.set(.tpr, 0);
+    configureLocalApic();
     const bsp_apic_id = local_apic.getId();
     std.log.info("BSP LAPIC ID: {}", .{bsp_apic_id});
 
-    // TODO: For APS
-    //
-    // enable Local APIC
-    // *((volatile uint32_t*)(lapic_addr + 0x0F0)) = *((volatile uint32_t*)(lapic_addr + 0x0F0)) | 0x100;
-    // core_num = lapic_ids[*((volatile uint32_t*)(lapic_addr + 0x20)) >> 24];
-
     std.log.info("starting {} APs", .{numcores - 1});
     var successfulStarted: u8 = 0;
+    // TODO: Start APs in parallel? Need to figure out how to tell the AP it's stack in that case
     for (0..numcores) |proc_index| {
-        const info = proc_infos[proc_index] orelse continue;
-        const lapic_id = info.id;
-        const proc_uid = info.processor_uid;
+        const lapic_id = proc_index_from_apic_id[proc_index] orelse continue;
         if (lapic_id == bsp_apic_id) continue;
 
         const stack_page = &ap_stack_pages[proc_index];
         _ap_arg_sp = @intFromPtr(stack_page) + stack_page.len;
 
         apReady.store(false, .release);
-        std.log.info("starting AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+        std.log.info("starting AP: LAPIC={}", .{lapic_id});
 
         std.log.debug("sending INIT IPI", .{});
         local_apic.sendIpi(lapic_id, .{ .vector = 0, .delivery_mode = .init });
@@ -815,12 +862,12 @@ fn startupAps() !void {
             sleep(1_000_000);
             std.log.debug("checking apDone", .{});
             if (!apReady.load(.acquire)) {
-                std.log.err("failed to start AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+                std.log.err("failed to start AP: LAPIC={}", .{lapic_id});
                 continue;
             }
         }
 
-        std.log.debug("started AP: LAPIC={} UID={}", .{ lapic_id, proc_uid });
+        std.log.debug("started AP: LAPIC={}", .{lapic_id});
         successfulStarted += 1;
     }
     std.log.debug("successfully started {} APs", .{successfulStarted});

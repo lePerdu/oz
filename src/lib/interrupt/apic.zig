@@ -88,6 +88,8 @@ pub const DeliveryMode = enum(u3) {
 };
 
 pub const Local = extern struct {
+    pub const SPURIOUS_VECTOR = 0xF0;
+
     /// All accesses must be done on 128-bit-aligned 32-bit words.
     /// Using an array instead of individual fields makes this explicit to the compiler
     cells: [0x40]Cell,

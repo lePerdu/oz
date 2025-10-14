@@ -20,6 +20,16 @@ pub fn setInterrupts(enabled: bool) void {
     }
 }
 
+pub fn nmiEnable() void {
+    port_io.outbComptimePort(0x70, port_io.inbComptimePort(0x70) & 0x7F);
+    _ = port_io.inbComptimePort(0x71);
+}
+
+pub fn nmiDisable() void {
+    port_io.outbComptimePort(0x70, port_io.inbComptimePort(0x70) | 0x80);
+    _ = port_io.inbComptimePort(0x71);
+}
+
 pub const DescriptorTableRegister = extern struct {
     limit: u16 align(1),
     base: u64 align(1),
@@ -39,6 +49,14 @@ pub fn setGdtr(base: u64, limit: u16) void {
         // Specifying `reg` as an input/output parameter is the only way I've found that generates the correct assembly
         // TODO: Figure out the "proper" way to specify this
         : [reg] "=&m" (reg),
+    );
+}
+
+pub fn setTr(seg: SegmentSelector) void {
+    const bits: u16 = @bitCast(seg);
+    asm volatile ("ltr %[reg]"
+        :
+        : [reg] "r" (bits),
     );
 }
 
@@ -201,16 +219,6 @@ pub const pic = struct {
         ioWait();
     }
 };
-
-pub fn nmiEnable() void {
-    port_io.outbComptimePort(0x70, port_io.inbComptimePort(0x70) & 0x7F);
-    _ = port_io.inbComptimePort(0x71);
-}
-
-pub fn nmiDisable() void {
-    port_io.outbComptimePort(0x70, port_io.inbComptimePort(0x70) | 0x80);
-    _ = port_io.inbComptimePort(0x71);
-}
 
 pub const InterruptFrame = extern struct {
     ip: u64,
