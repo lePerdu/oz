@@ -1,12 +1,13 @@
 pub inline fn inb(port: u16) u8 {
-    return asm ("inb %[port], %[ret]"
+    // NOTE: marked volatile even though it has an output, since reads can be effectful
+    return asm volatile ("inb %[port], %[ret]"
         : [ret] "={al}" (-> u8),
         : [port] "{dx}" (port),
     );
 }
 
 pub inline fn inbComptimePort(comptime port: u8) u8 {
-    return asm ("inb %[port], %[ret]"
+    return asm volatile ("inb %[port], %[ret]"
         : [ret] "={al}" (-> u8),
         : [port] "N" (port),
     );
@@ -14,7 +15,7 @@ pub inline fn inbComptimePort(comptime port: u8) u8 {
 
 pub inline fn insb(port: u16, buf: []u8) void {
     const buf_ptr = buf.ptr;
-    asm (
+    asm volatile (
         \\cld
         \\rep insb
         : // TODO: Figure out syntax for secifying what memory is written
