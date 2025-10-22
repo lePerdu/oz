@@ -61,6 +61,17 @@ var kernel_heap_state: struct {
     }
 } = .{};
 
+// TODO: Use better timer
+fn readCycleCounter() u64 {
+    var high: u32 = 0;
+    var low: u32 = 0;
+    asm ("rdtsc"
+        : [high] "={edx}" (high),
+          [low] "={eax}" (low),
+    );
+    return @as(u64, high) << 32 | @as(u64, low);
+}
+
 var global_keyboard_controller = keyboard.Controller{};
 var global_mouse_controller = mouse.Controller{};
 var global_font = ozlib.font.Psf1Font.empty;
@@ -203,13 +214,28 @@ export fn main() callconv(.{
         .pixels_per_row = bootinfo.fb_scanline,
     };
     std.log.info("Frame buffer: width={} height={}", .{ global_video_fb.width, global_video_fb.height });
-    global_video_fb.fill(.fromRgb(0, 0, 0), .fromSize(global_video_fb.width, global_video_fb.height));
-    // var x_offset: i32 = 0;
-    // const y_offset: i32 = 0;
-    // while (true) {
-    //     renderGradient(&global_video_fb, x_offset, y_offset);
-    //     x_offset +%= 1;
-    // }
+    global_video_fb.region(.fromSize(global_video_fb.width, global_video_fb.height))
+        .fill(.fromRgb(0, 0, 0));
+
+    logTscFreq();
+
+    var gradient_win = global_video_fb.region(.{
+        .x = 0,
+        .y = global_video_fb.height / 2,
+        .width = global_video_fb.width,
+        .height = global_video_fb.height / 2,
+    });
+    var x_offset: i32 = 0;
+    const y_offset: i32 = 0;
+    while (true) {
+        const start = readCycleCounter();
+        renderGradient(&gradient_win, x_offset, y_offset);
+        const end = readCycleCounter();
+        std.log.debug("rendered in {} Mcycles", .{@as(f32, @floatFromInt(end - start)) / 1_000_000.0});
+        x_offset +%= 1;
+        // asm volatile ("pause" ::: .{ .memory = true });
+        // asm volatile ("hlt" ::: .{ .memory = true });
+    }
 
     // switch (kallocator.deinit()) {
     //     .ok => {},
@@ -222,17 +248,30 @@ export fn main() callconv(.{
     kdebug.halt();
 }
 
-fn renderGradient(video_fb: *ozlib.FrameBuffer, x_offset: i32, y_offset: i32) void {
-    for (0..video_fb.height) |y| {
-        const y_: i32 = @intCast(y);
-        for (0..video_fb.width) |x| {
-            const x_: i32 = @intCast(x);
-            video_fb.set(x, y, .{
-                .r = 0,
-                .g = @intCast((y_ + y_offset) & 0xFF),
-                .b = @intCast((x_ + x_offset) & 0xFF),
-            });
+fn renderGradient(gradient_win: *ozlib.FrameBuffer, x_offset: i32, y_offset: i32) void {
+    // TODO: The first version is faster is 1.5-2x faster in release mode, but 5x slower in debug mode...
+    // Ideally I could find an approach that is fast in both versions
+    // TODO: File bug report because of how much slower this is in debug mode?
+
+    // var y_val: u8 = @intCast(y_offset & 0xFF);
+    // for (0..gradient_win.height) |y| {
+    //     var x_val: u8 = @intCast(x_offset & 0xFF);
+    //     for (0..gradient_win.width) |x| {
+    //         gradient_win.set(x, y, .{ .r = 0, .g = y_val, .b = x_val });
+    //         x_val +%= 1;
+    //     }
+    //     y_val +%= 1;
+    // }
+    var y_val: u8 = @intCast(y_offset & 0xFF);
+    const x_init_val: u8 = @intCast(x_offset & 0xFF);
+    var row_iter = gradient_win.iterRows();
+    while (row_iter.next()) |row| {
+        var x_val = x_init_val;
+        for (row) |*pixel| {
+            pixel.* = .{ .r = 0, .g = y_val, .b = x_val };
+            x_val +%= 1;
         }
+        y_val +%= 1;
     }
 }
 

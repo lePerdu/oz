@@ -15,22 +15,23 @@ pub const Pixel = extern struct {
     }
 };
 
-// TODO: Use u32?
 pub const Coord = struct {
-    x: usize,
-    y: usize,
+    x: u32,
+    y: u32,
 
     pub const zero = @This(){ .x = 0, .y = 0 };
 };
 
 pub const Rect = struct {
-    base: Coord,
-    size: Coord,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 
-    pub const empty = @This(){ .base = .zero, .size = .zero };
+    pub const empty = @This(){ .x = 0, .y = 0, .width = 0, .height = 0 };
 
-    pub fn fromSize(width: usize, height: usize) @This() {
-        return .{ .base = .zero, .size = .{ .x = width, .y = height } };
+    pub fn fromSize(width: u32, height: u32) @This() {
+        return .{ .x = 0, .y = 0, .width = width, .height = height };
     }
 };
 
@@ -81,7 +82,7 @@ pub const FrameBuffer = struct {
         return @ptrCast(&self.raw[self.index(x, y)]);
     }
 
-    pub fn offset(self: *Self, x: usize, y: usize) [*]Pixel {
+    pub fn offset(self: *const Self, x: usize, y: usize) [*]Pixel {
         return @ptrCast(&self.raw[self.index(x, y)]);
     }
 
@@ -89,28 +90,53 @@ pub const FrameBuffer = struct {
         return self.raw[self.index(x, y)];
     }
 
-    pub fn set(self: *Self, x: usize, y: usize, p: Pixel) void {
+    pub fn set(self: *const Self, x: usize, y: usize, p: Pixel) void {
         self.raw[self.index(x, y)] = p;
     }
 
-    pub fn blt(self: *Self, src: *const Self, src_region: Rect, dst_base: Coord) void {
-        // TODO: Bounds check
-        const row_len = src_region.size.x;
-        for (0..src_region.size.y) |dy| {
-            // Optimization if the buffers have the same pixel format
-            const src_row = src.offsetConst(src_region.base.x, src_region.base.y + dy);
-            const dst_row = self.offset(dst_base.x, dst_base.y + dy);
-            @memcpy(dst_row[0..row_len], src_row[0..row_len]);
+    pub fn copy(self: *const Self, src: *const Self) void {
+        std.debug.assert(self.width == src.width and self.height == src.height);
+        var self_iter = self.iterRows();
+        var src_iter = self.iterRows();
+        while (self_iter.next()) |self_row| {
+            @memcpy(self_row, src_iter.next().?);
         }
     }
 
-    pub fn fill(self: *Self, pixel: Pixel, region: Rect) void {
-        // TODO: Bounds check
-        const row_len = region.size.x;
-        for (0..region.size.y) |dy| {
-            const dst_row = self.offset(region.base.x, region.base.y + dy);
-            @memset(dst_row[0..row_len], pixel);
+    pub fn fill(self: *const Self, pixel: Pixel) void {
+        var row_iter = self.iterRows();
+        while (row_iter.next()) |row| {
+            @memset(row, pixel);
         }
+    }
+
+    pub fn region(self: *const Self, rect: Rect) Self {
+        std.debug.assert(rect.x + rect.width <= self.width);
+        std.debug.assert(rect.y + rect.height <= self.height);
+        return Self{
+            .raw = @ptrCast(&self.raw[rect.y * self.pixels_per_row + rect.x]),
+            .width = rect.width,
+            .height = rect.height,
+            .pixels_per_row = self.pixels_per_row,
+        };
+    }
+
+    pub const RowIter = struct {
+        fb: *const FrameBuffer,
+        offset: usize = 0,
+
+        pub fn next(self: *@This()) ?[]Pixel {
+            if (self.offset >= self.fb.pixels_per_row * self.fb.height) {
+                return null;
+            }
+            const row = self.fb.raw[self.offset..][0..self.fb.width];
+            self.offset += self.fb.pixels_per_row;
+            return row;
+        }
+    };
+
+    pub fn iterRows(self: *const Self) RowIter {
+        return .{ .fb = self };
     }
 };
 
