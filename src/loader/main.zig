@@ -315,7 +315,11 @@ fn createPageTables(
                     break :fb;
                 }
                 const page = paging.addressToPageNum(info.fb_ptr + fb_offset);
-                pt.entries[pt_index] = initSmallPage(page);
+                pt.entries[pt_index] = paging.PageTableEntry.init(
+                    page,
+                    // PAT entry 7 (assigned to WC later in the OS)
+                    .{ .writable = true, .huge_page = true, .cache_disabled = true, .write_through = true },
+                );
             }
         }
     }

@@ -74,6 +74,38 @@ var global_video_fb = ozlib.FrameBuffer{
     .raw = &empty_fb,
 };
 
+extern fn _configurePat() void;
+
+fn logTscFreq() void {
+    var denom: u32 = 0;
+    var numer: u32 = 0;
+    var core: u32 = 0;
+    asm ("cpuid"
+        : [denom] "={eax}" (denom),
+          [numer] "={ebx}" (numer),
+          [core] "={ecx}" (core),
+        : [leaf] "{eax}" (0x15),
+        : .{ .rdx = true });
+
+    const tsc = if (denom != 0) (@as(u64, core) * @as(u64, numer) / @as(u64, denom)) else 0;
+    std.log.info("core = {}, numer = {}, denom = {}, tsc = {}", .{ core, numer, denom, tsc });
+
+    // Measure using PIT
+    {
+        const measure_duration_ms = 10;
+        pit.configureOneshot(measure_duration_ms * 1000);
+        const start = readCycleCounter();
+        while (!pit.isDone()) {
+            pause();
+        }
+        const end = readCycleCounter();
+
+        const ticks = end - start;
+        const per_sec = ticks * 1000 / measure_duration_ms;
+        std.log.info("ticks = {}, ticks_per_sec = {}", .{ ticks, per_sec });
+    }
+}
+
 export fn main() callconv(.{
     .x86_64_sysv = .{
         // Normal stack alignment is 16 bytes before a `call` instruction. Since
@@ -87,6 +119,7 @@ export fn main() callconv(.{
     std.log.info("Hello, kernel!", .{});
     std.log.info("Kernel size: {} B ({} KiB)", .{ getKernelSize(), getKernelSize() / 1024 });
 
+    _configurePat();
     collectProcessorInfo();
 
     const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
