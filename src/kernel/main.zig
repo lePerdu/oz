@@ -205,7 +205,10 @@ export fn main() callconv(.{
         keyboard_enabled = false;
         mouse_enabled = false;
     };
-    int.pic.setEnabled(.{ .keyboard = keyboard_enabled, .mouse = mouse_enabled });
+
+    // Always enables keyboard and mouse IRQs
+    // TODO: Is that OK?
+    configureIoApic();
 
     global_video_fb = ozlib.FrameBuffer{
         .raw = @ptrCast(&fb),
@@ -475,11 +478,12 @@ fn setupInterrupts() !void {
     }
 
     // Custom handlers
-    // TODO: Handle keyboard/mouse with I/O APIC
-    idt[int.pic.IRQ_OFFSET + keyboard.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&keyboardHandler), int_selector, 0, .int, 0);
-    idt[int.pic.IRQ_OFFSET + mouse.IRQ] = int.InterruptDescriptor.init(@intFromPtr(&mouseHandler), int_selector, 0, .int, 0);
     idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
 
+    idt[IOAPIC_KEYBOARD_INT] = int.InterruptDescriptor.init(@intFromPtr(&apicKeyboardHandler), int_selector, 0, .int, 0);
+    idt[IOAPIC_MOUSE_INT] = int.InterruptDescriptor.init(@intFromPtr(&apicMouseHandler), int_selector, 0, .int, 0);
+
+    // TODO: Does PIC spurious interrupt need to be handled even when it's disabled?
     idt[LocalApic.SPURIOUS_VECTOR] = int.InterruptDescriptor.init(@intFromPtr(&apicSpuriousIntHandler), int_selector, 0, .int, 0);
 
     configureSystemTables();
@@ -503,8 +507,9 @@ var cursor_y: usize = 0;
 const empty_glyph = std.mem.zeroes([64]u8);
 var layout_controller = keyboard.LayoutController{ .layout = &keyboard.us_layout };
 
-fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
-    defer int.pic.sendMasterEoi();
+fn apicKeyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+    defer local_apic.sendEoi();
+    // std.log.debug("APIC keyboard IRQ: lapic_id={}", .{local_apic.getId()});
     const raw_event = global_keyboard_controller.handleInterrupt() orelse return;
     std.log.debug("raw event={}", .{raw_event});
     const event = layout_controller.input(raw_event) orelse return;
@@ -569,8 +574,8 @@ fn keyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
     }
 }
 
-fn mouseHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
-    defer int.pic.sendSlaveEoi();
+fn apicMouseHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+    defer local_apic.sendEoi();
     const event = global_mouse_controller.handleInterrupt() orelse return;
     std.log.info("mouse event: {}", .{event});
 }
@@ -798,6 +803,50 @@ var numcores: u8 = 0;
 var proc_index_from_apic_id: [256]?u8 = .{null} ** 256;
 var apic_id_from_proc_index: [256]?u8 = .{null} ** 256;
 
+const IoApic = ozlib.interrupt.apic.Io;
+const IoApicDesc = struct {
+    // TODO: Move these fields into IoApic?
+    id: u8,
+    irq_base: u8,
+    regs: *volatile IoApic,
+};
+var io_apics_buf: [256]IoApicDesc = undefined;
+var io_apics = std.ArrayList(IoApicDesc).initBuffer(&io_apics_buf);
+
+const IOAPIC_KEYBOARD_INT = 0x40;
+const IOAPIC_MOUSE_INT = 0x41;
+
+fn findIoApicById(id: u8) ?*IoApicDesc {
+    for (io_apics.items) |*apic| {
+        if (apic.id == id) {
+            return apic;
+        }
+    }
+    return null;
+}
+
+fn configureIoApic() void {
+    // TODO: Handle IRQs spread over multiple IO APICs
+    // TODO: Handle IRQ overrides
+
+    // Route to the current processor (the BSP)
+    const dest_apic = local_apic.getId();
+
+    const apic = io_apics.items[0];
+    std.debug.assert(apic.irq_base == 0);
+    apic.regs.setRedirectionEntry(keyboard.IRQ, .{
+        .vector = IOAPIC_KEYBOARD_INT,
+        .delivery_mode = .fixed,
+        .destination = dest_apic,
+    });
+
+    apic.regs.setRedirectionEntry(mouse.IRQ, .{
+        .vector = IOAPIC_MOUSE_INT,
+        .delivery_mode = .fixed,
+        .destination = dest_apic,
+    });
+}
+
 fn collectProcessorInfo() void {
     const rsdp: *const ozlib.acpi.Rsdp = @ptrFromInt(bootinfo.acpi_ptr);
 
@@ -831,6 +880,33 @@ fn collectProcessorInfo() void {
             },
             .local_apic_address_override => |override| {
                 local_apic = @ptrFromInt(override.addr);
+            },
+            .io_apic => |io| {
+                // Don't override an exising (SAPIC) entry
+                if (findIoApicById(io.id) == null) {
+                    io_apics.appendAssumeCapacity(.{
+                        .id = io.id,
+                        // TODO: Check, don't cast
+                        .irq_base = @intCast(io.interrupt_base),
+                        .regs = @ptrFromInt(io.addr),
+                    });
+                }
+            },
+            .io_sapic => |io| {
+                // Update address if necessary
+                if (findIoApicById(io.id)) |existing| {
+                    existing.regs = @ptrFromInt(io.addr);
+                } else {
+                    io_apics.appendAssumeCapacity(.{
+                        .id = io.id,
+                        // TODO: Check, don't cast
+                        .irq_base = @intCast(io.interrupt_base),
+                        .regs = @ptrFromInt(io.addr),
+                    });
+                }
+            },
+            .interrupt_source_override => |int_override| {
+                _ = int_override;
             },
             else => {},
         }
