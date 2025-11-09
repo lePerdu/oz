@@ -117,16 +117,7 @@ fn logTscFreq() void {
     }
 }
 
-export fn main() callconv(.{
-    .x86_64_sysv = .{
-        // Normal stack alignment is 16 bytes before a `call` instruction. Since
-        // code entering here isn't _called_, there is no return address on the
-        // stack, which behaves like the stack was only 8-byte aligned before
-        // calling this function.
-        // TODO: Fix this by providing a return address instead?
-        .incoming_stack_alignment = 8,
-    },
-}) noreturn {
+export fn main() callconv(upcall) noreturn {
     std.log.info("Hello, kernel!", .{});
     std.log.info("Kernel size: {} B ({} KiB)", .{ getKernelSize(), getKernelSize() / 1024 });
 
@@ -478,27 +469,185 @@ fn setupInterrupts() !void {
     }
 
     // Custom handlers
-    idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
+    // idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
+    idt[0x32] = int.InterruptDescriptor.init(makeIsr(int32Handler), int_selector, 0, .int, 0);
 
-    idt[IOAPIC_KEYBOARD_INT] = int.InterruptDescriptor.init(@intFromPtr(&apicKeyboardHandler), int_selector, 0, .int, 0);
-    idt[IOAPIC_MOUSE_INT] = int.InterruptDescriptor.init(@intFromPtr(&apicMouseHandler), int_selector, 0, .int, 0);
+    idt[IOAPIC_KEYBOARD_INT] = int.InterruptDescriptor.init(makeIsr(apicKeyboardHandler), int_selector, 0, .int, 0);
+    idt[IOAPIC_MOUSE_INT] = int.InterruptDescriptor.init(makeIsr(apicMouseHandler), int_selector, 0, .int, 0);
 
     // TODO: Does PIC spurious interrupt need to be handled even when it's disabled?
-    idt[LocalApic.SPURIOUS_VECTOR] = int.InterruptDescriptor.init(@intFromPtr(&apicSpuriousIntHandler), int_selector, 0, .int, 0);
+    idt[LocalApic.SPURIOUS_VECTOR] = int.InterruptDescriptor.init(makeIsr(apicSpuriousIntHandler), int_selector, 0, .int, 0);
 
     configureSystemTables();
     std.log.info("interrupts configured and enabled", .{});
 }
 
-fn int32Handler() callconv(.{ .x86_64_interrupt = .{} }) void {
-    std.log.info("int 0x32!", .{});
+const GpRegisterSaveArea = struct {
+    // TODO: Do these need to be saved?
+    // gs: u16 align(8),
+    // fs: u16 align(8),
+    // es: u16 align(8),
+    // ds: u16 align(8),
+    // // CS and SS pushed by CPU
+
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    // RSP pushed by CPU
+    rbx: u64,
+    rdx: u64,
+    rcx: u64,
+    rax: u64,
+};
+
+const FxSaveArea = struct {
+    // TODO: Specify offsets registers? Might not be needed if the kernel doesn't care
+    bytes: [512]u8 align(16),
+};
+
+fn makeIsr(
+    comptime handler: fn (
+        int_ctx: *int.InterruptFrame,
+        registers: *GpRegisterSaveArea,
+    ) callconv(upcall) void,
+) u64 {
+    const S = struct {
+        fn isr() callconv(.naked) void {
+            asm volatile (
+                \\push %rax
+                \\push %rcx
+                \\push %rdx
+                \\push %rbx
+                \\push %rbp
+                \\push %rsi
+                \\push %rdi
+                \\push %r8
+                \\push %r9
+                \\push %r10
+                \\push %r11
+                \\push %r12
+                \\push %r13
+                \\push %r14
+                \\push %r15
+                \\cld
+                \\mov %rsp, %rdi
+                \\add %[reg_save_size], %rdi
+                \\mov %rsp, %rsi
+                \\call %[handler:P]
+                \\pop %r15
+                \\pop %r14
+                \\pop %r13
+                \\pop %r12
+                \\pop %r11
+                \\pop %r10
+                \\pop %r9
+                \\pop %r8
+                \\pop %rdi
+                \\pop %rsi
+                \\pop %rbp
+                \\pop %rbx
+                \\pop %rdx
+                \\pop %rcx
+                \\pop %rax
+                \\iretq
+                :
+                : [handler] "X" (handler),
+                  [reg_save_size] "n" (@sizeOf(GpRegisterSaveArea)),
+            );
+        }
+    };
+    return @intFromPtr(&S.isr);
 }
 
-fn picSpuriousIntHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+fn makeIsrWithCode(
+    comptime handler: fn (
+        int_ctx: *int.InterruptFrame,
+        registers: *GpRegisterSaveArea,
+        code: u64,
+    ) callconv(upcall) void,
+) u64 {
+    const S = struct {
+        fn isr() callconv(.naked) void {
+            asm volatile (
+                \\push %rax
+                \\push %rcx
+                \\push %rdx
+                \\push %rbx
+                \\push %rbp
+                \\push %rsi
+                \\push %rdi
+                \\push %r8
+                \\push %r9
+                \\push %r10
+                \\push %r11
+                \\push %r12
+                \\push %r13
+                \\push %r14
+                \\push %r15
+                \\cld
+                \\mov %rsp, %rdi
+                \\add %[reg_save_size] + 8, %rdi
+                \\mov %rsp, %rsi
+                \\mov %[reg_save_size:c](%rsp), %rdx
+                \\call %[handler:P]
+                \\pop %r15
+                \\pop %r14
+                \\pop %r13
+                \\pop %r12
+                \\pop %r11
+                \\pop %r10
+                \\pop %r9
+                \\pop %r8
+                \\pop %rdi
+                \\pop %rsi
+                \\pop %rbp
+                \\pop %rbx
+                \\pop %rdx
+                \\pop %rcx
+                \\pop %rax
+                \\add 8, %rsp
+                \\iretq
+                :
+                : [handler] "X" (handler),
+                  [reg_save_size] "n" (@sizeOf(GpRegisterSaveArea)),
+            );
+        }
+    };
+    return @intFromPtr(&S.isr);
+}
+
+export fn int32Handler(
+    int_ctx: *int.InterruptFrame,
+    registers: *GpRegisterSaveArea,
+) callconv(upcall) void {
+    _ = registers;
+    std.log.info("int 0x32: context={}", .{int_ctx});
+}
+
+export fn picSpuriousIntHandler(
+    int_ctx: *int.InterruptFrame,
+    registers: *GpRegisterSaveArea,
+) callconv(upcall) void {
+    _ = int_ctx;
+    _ = registers;
     std.log.info("PIC spurious interrupt!", .{});
 }
 
-fn apicSpuriousIntHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+export fn apicSpuriousIntHandler(
+    int_ctx: *int.InterruptFrame,
+    registers: *GpRegisterSaveArea,
+) callconv(upcall) void {
+    _ = int_ctx;
+    _ = registers;
     std.log.info("APIC spurious interrupt!", .{});
 }
 
@@ -507,7 +656,12 @@ var cursor_y: usize = 0;
 const empty_glyph = std.mem.zeroes([64]u8);
 var layout_controller = keyboard.LayoutController{ .layout = &keyboard.us_layout };
 
-fn apicKeyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+export fn apicKeyboardHandler(
+    int_ctx: *int.InterruptFrame,
+    registers: *GpRegisterSaveArea,
+) callconv(upcall) void {
+    _ = int_ctx;
+    _ = registers;
     defer local_apic.sendEoi();
     // std.log.debug("APIC keyboard IRQ: lapic_id={}", .{local_apic.getId()});
     const raw_event = global_keyboard_controller.handleInterrupt() orelse return;
@@ -574,7 +728,12 @@ fn apicKeyboardHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
     }
 }
 
-fn apicMouseHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
+export fn apicMouseHandler(
+    int_ctx: *int.InterruptFrame,
+    registers: *GpRegisterSaveArea,
+) callconv(upcall) void {
+    _ = int_ctx;
+    _ = registers;
     defer local_apic.sendEoi();
     const event = global_mouse_controller.handleInterrupt() orelse return;
     std.log.info("mouse event: {}", .{event});
@@ -582,35 +741,53 @@ fn apicMouseHandler() callconv(.{ .x86_64_interrupt = .{} }) void {
 
 fn makeExceptionHandler(comptime selector: int.SegmentSelector, comptime name: []const u8, comptime vector: u8, comptime gate_type: int.GateType) int.InterruptDescriptor {
     const S = struct {
-        fn handler(frame: *int.InterruptFrame) callconv(.{ .x86_64_interrupt = .{} }) void {
+        fn handler(frame: *int.InterruptFrame, registers: *GpRegisterSaveArea) callconv(upcall) void {
             _ = frame;
+            _ = registers;
             std.log.info("int v=0x{x:02}: {s}", .{ vector, name });
             kdebug.halt();
         }
     };
-    return int.InterruptDescriptor.init(@intFromPtr(&S.handler), selector, 0, gate_type, 0);
+    const src = @src();
+    @export(&S.handler, .{
+        .name = std.fmt.comptimePrint("{s}.{s}.{}:{s}.handler", .{ src.module, src.fn_name, vector, name }),
+        .linkage = .strong,
+    });
+    return int.InterruptDescriptor.init(makeIsr(S.handler), selector, 0, gate_type, 0);
 }
 
 fn makeExceptionHandlerWithCode(comptime selector: int.SegmentSelector, comptime name: []const u8, comptime vector: u8, comptime gate_type: int.GateType) int.InterruptDescriptor {
     const S = struct {
-        fn handler(frame: *int.InterruptFrame, code: usize) callconv(.{ .x86_64_interrupt = .{} }) void {
+        fn handler(frame: *int.InterruptFrame, registers: *GpRegisterSaveArea, code: u64) callconv(upcall) void {
             _ = frame;
+            _ = registers;
             std.log.info("int v=0x{x:02} e=0x{x:04}: {s}", .{ vector, code, name });
             kdebug.halt();
         }
     };
-    return int.InterruptDescriptor.init(@intFromPtr(&S.handler), selector, 0, gate_type, 0);
+    const src = @src();
+    @export(&S.handler, .{
+        .name = std.fmt.comptimePrint("{s}.{s}.{}:{s}.handler", .{ src.module, src.fn_name, vector, name }),
+        .linkage = .strong,
+    });
+    return int.InterruptDescriptor.init(makeIsrWithCode(S.handler), selector, 0, gate_type, 0);
 }
 
 fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vector: u8, comptime irq: u4) int.InterruptDescriptor {
     const S = struct {
-        fn handler(frame: *int.InterruptFrame) callconv(.{ .x86_64_interrupt = .{} }) void {
-            _ = frame;
+        fn handler(int_ctx: *int.InterruptFrame, registers: *GpRegisterSaveArea) callconv(upcall) void {
+            _ = int_ctx;
+            _ = registers;
             std.log.info("int v=0x{x:02}: IRQ{}", .{ vector, irq });
             int.pic.sendEoi(irq);
         }
     };
-    return int.InterruptDescriptor.init(@intFromPtr(&S.handler), selector, 0, .int, 0);
+    const src = @src();
+    @export(&S.handler, .{
+        .name = std.fmt.comptimePrint("{s}.{s}.{}.handler", .{ src.module, src.fn_name, irq }),
+        .linkage = .strong,
+    });
+    return int.InterruptDescriptor.init(makeIsr(S.handler), selector, 0, .int, 0);
 }
 
 // const IMAGE_JPEG = @embedFile("./assets/shrimp.jpeg");
@@ -655,16 +832,14 @@ fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vecto
 //     );
 // }
 
-export fn apMain() callconv(.{
-    .x86_64_sysv = .{
-        // Normal stack alignment is 16 bytes before a `call` instruction. Since
-        // code entering here isn't _called_, there is no return address on the
-        // stack, which behaves like the stack was only 8-byte aligned before
-        // calling this function.
-        // TODO: Fix this by providing a return address instead?
-        .incoming_stack_alignment = 8,
-    },
-}) void {
+// Normal stack alignment is 16 bytes before a `call` instruction. Since
+// code entering here isn't _called_, there is no return address on the
+// stack, which behaves like the stack was only 8-byte aligned before
+// calling this function.
+// TODO: Fix this by ensuring the stack is properly aligned in the first place for all upcalls
+const upcall: std.builtin.CallingConvention = .{ .x86_64_sysv = .{ .incoming_stack_alignment = 8 } };
+
+export fn apMain() callconv(upcall) void {
     apReady.store(true, .release);
     std.log.info("AP started!", .{});
     configureLocalApic();
