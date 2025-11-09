@@ -392,9 +392,25 @@ fn configureSystemTables() void {
     int.enableInterrupts();
 }
 
+const StackRegion = [4096]u8;
+
+const PerCoreStacks = struct {
+    syscall: StackRegion,
+    int: StackRegion,
+    trap: StackRegion,
+    nmi: StackRegion,
+};
+
+const IRQ_IST = 1;
+const TRAP_IST = 2;
+const NMI_IST = 3;
+
 fn setupInterrupts() !void {
+    // TODO: Lump these into a single allocation?
     gdt = try os.heap.page_allocator.alloc(u64, tss_offset_index + 2 * @as(usize, numcores));
     tss_list = try os.heap.page_allocator.alloc(int.TaskStateSegment, numcores);
+    // TODO: Gather all per-core structures together into single allocations?
+    const per_core_stakcs = try os.heap.page_allocator.alloc(PerCoreStacks, numcores);
 
     gdt[0] = @bitCast(int.SegmentDescriptor.null_descriptor);
 
@@ -426,7 +442,11 @@ fn setupInterrupts() !void {
     for (tss_list, 0..) |*tss, tss_index| {
         // Max offset so that it's invalid
         tss.iopb = @sizeOf(@TypeOf(tss.*));
-        // TODO: Fill in other TSS fields
+        tss.rsp_table[0] = @intFromPtr(&per_core_stakcs[tss_index].syscall);
+        tss.ist_table[IRQ_IST - 1] = @intFromPtr(&per_core_stakcs[tss_index].int);
+        tss.ist_table[TRAP_IST - 1] = @intFromPtr(&per_core_stakcs[tss_index].trap);
+        tss.ist_table[NMI_IST - 1] = @intFromPtr(&per_core_stakcs[tss_index].nmi);
+        // TODO: Fill in other TSS fields?
 
         const tss_bits: u128 = @bitCast(int.LongModeSegmentDescriptor.init(
             @intFromPtr(tss),
@@ -442,6 +462,7 @@ fn setupInterrupts() !void {
     idt[0x00] = makeExceptionHandler(int_selector, "divide error", 0x00, .trap);
     idt[0x01] = makeExceptionHandler(int_selector, "debug exception", 0x01, .trap);
     idt[0x02] = makeExceptionHandler(int_selector, "nmi", 0x02, .int);
+    idt[0x02].ist = NMI_IST;
     idt[0x03] = makeExceptionHandler(int_selector, "breakpoint", 0x03, .trap);
     idt[0x04] = makeExceptionHandler(int_selector, "overflow", 0x04, .trap);
     idt[0x05] = makeExceptionHandler(int_selector, "bound range exceeded", 0x05, .trap);
@@ -469,14 +490,13 @@ fn setupInterrupts() !void {
     }
 
     // Custom handlers
-    // idt[0x32] = int.InterruptDescriptor.init(@intFromPtr(&int32Handler), int_selector, 0, .int, 0);
-    idt[0x32] = int.InterruptDescriptor.init(makeIsr(int32Handler), int_selector, 0, .int, 0);
+    idt[0x32] = int.InterruptDescriptor.init(makeIsr(int32Handler), int_selector, IRQ_IST, .int, 0);
 
-    idt[IOAPIC_KEYBOARD_INT] = int.InterruptDescriptor.init(makeIsr(apicKeyboardHandler), int_selector, 0, .int, 0);
-    idt[IOAPIC_MOUSE_INT] = int.InterruptDescriptor.init(makeIsr(apicMouseHandler), int_selector, 0, .int, 0);
+    idt[IOAPIC_KEYBOARD_INT] = int.InterruptDescriptor.init(makeIsr(apicKeyboardHandler), int_selector, IRQ_IST, .int, 0);
+    idt[IOAPIC_MOUSE_INT] = int.InterruptDescriptor.init(makeIsr(apicMouseHandler), int_selector, IRQ_IST, .int, 0);
 
     // TODO: Does PIC spurious interrupt need to be handled even when it's disabled?
-    idt[LocalApic.SPURIOUS_VECTOR] = int.InterruptDescriptor.init(makeIsr(apicSpuriousIntHandler), int_selector, 0, .int, 0);
+    idt[LocalApic.SPURIOUS_VECTOR] = int.InterruptDescriptor.init(makeIsr(apicSpuriousIntHandler), int_selector, IRQ_IST, .int, 0);
 
     configureSystemTables();
     std.log.info("interrupts configured and enabled", .{});
@@ -753,7 +773,7 @@ fn makeExceptionHandler(comptime selector: int.SegmentSelector, comptime name: [
         .name = std.fmt.comptimePrint("{s}.{s}.{}:{s}.handler", .{ src.module, src.fn_name, vector, name }),
         .linkage = .strong,
     });
-    return int.InterruptDescriptor.init(makeIsr(S.handler), selector, 0, gate_type, 0);
+    return int.InterruptDescriptor.init(makeIsr(S.handler), selector, TRAP_IST, gate_type, 0);
 }
 
 fn makeExceptionHandlerWithCode(comptime selector: int.SegmentSelector, comptime name: []const u8, comptime vector: u8, comptime gate_type: int.GateType) int.InterruptDescriptor {
@@ -770,7 +790,7 @@ fn makeExceptionHandlerWithCode(comptime selector: int.SegmentSelector, comptime
         .name = std.fmt.comptimePrint("{s}.{s}.{}:{s}.handler", .{ src.module, src.fn_name, vector, name }),
         .linkage = .strong,
     });
-    return int.InterruptDescriptor.init(makeIsrWithCode(S.handler), selector, 0, gate_type, 0);
+    return int.InterruptDescriptor.init(makeIsrWithCode(S.handler), selector, TRAP_IST, gate_type, 0);
 }
 
 fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vector: u8, comptime irq: u4) int.InterruptDescriptor {
@@ -787,7 +807,7 @@ fn makeFallbackPicHandler(comptime selector: int.SegmentSelector, comptime vecto
         .name = std.fmt.comptimePrint("{s}.{s}.{}.handler", .{ src.module, src.fn_name, irq }),
         .linkage = .strong,
     });
-    return int.InterruptDescriptor.init(makeIsr(S.handler), selector, 0, .int, 0);
+    return int.InterruptDescriptor.init(makeIsr(S.handler), selector, IRQ_IST, .int, 0);
 }
 
 // const IMAGE_JPEG = @embedFile("./assets/shrimp.jpeg");
