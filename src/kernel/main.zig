@@ -213,6 +213,40 @@ export fn main() callconv(upcall) noreturn {
 
     logTscFreq();
 
+    const stacks = os.heap.page_allocator.alignedAlloc([4096]u8, .fromByteUnits(16), 2) catch {
+        halt();
+    };
+    render1_tcb = .{
+        .context = .{
+            .rip = @intFromPtr(&renderLoop),
+            .rsp = @intFromPtr(&stacks[0][0]) + 4096,
+        },
+    };
+    schedule(&render1_tcb);
+    render2_tcb = .{
+        .context = .{
+            .rip = @intFromPtr(&renderLoop2),
+            .rsp = @intFromPtr(&stacks[1][0]) + 4096,
+        },
+    };
+    schedule(&render2_tcb);
+    schedulerStart();
+
+    // switch (kallocator.deinit()) {
+    //     .ok => {},
+    //     .leak => {
+    //         std.log.warn("leak detected", .{});
+    //     },
+    // }
+
+    // std.log.info("done", .{});
+    // kdebug.halt();
+}
+
+var render1_tcb: Tcb = undefined;
+var render2_tcb: Tcb = undefined;
+
+fn renderLoop() callconv(upcall) noreturn {
     var gradient_win = global_video_fb.region(.{
         .x = 0,
         .y = global_video_fb.height / 2,
@@ -229,17 +263,152 @@ export fn main() callconv(upcall) noreturn {
         x_offset +%= 1;
         // asm volatile ("pause" ::: .{ .memory = true });
         // asm volatile ("hlt" ::: .{ .memory = true });
+        yield(&render1_tcb);
+    }
+}
+
+fn renderLoop2() callconv(upcall) noreturn {
+    var gradient_win = global_video_fb.region(.{
+        .x = global_video_fb.width / 2,
+        .y = 0,
+        .width = global_video_fb.width / 2,
+        .height = global_video_fb.height / 2,
+    });
+    var x_offset: i32 = 0;
+    const y_offset: i32 = 0;
+    while (true) {
+        const start = readCycleCounter();
+        renderGradient(&gradient_win, x_offset, y_offset);
+        const end = readCycleCounter();
+        std.log.debug("rendered(2) in {} Mcycles", .{@as(f32, @floatFromInt(end - start)) / 1_000_000.0});
+        x_offset -%= 1;
+        // asm volatile ("pause" ::: .{ .memory = true });
+        // asm volatile ("hlt" ::: .{ .memory = true });
+        yield(&render2_tcb);
+    }
+}
+
+const SpinLock = struct {
+    flag: std.atomic.Value(bool) = .init(false),
+
+    const Self = @This();
+
+    pub fn tryLock(self: *Self) bool {
+        // TODO: Strong vs weak & atomic ordering
+        return self.flag.cmpxchgWeak(false, true, .acquire, .monotonic) == null;
     }
 
-    // switch (kallocator.deinit()) {
-    //     .ok => {},
-    //     .leak => {
-    //         std.log.warn("leak detected", .{});
-    //     },
-    // }
+    pub fn lock(self: *Self) void {
+        while (!self.tryLock()) {
+            pause();
+        }
+    }
 
-    std.log.info("done", .{});
-    kdebug.halt();
+    pub fn unlock(self: *Self) void {
+        self.flag.store(false, .release);
+    }
+};
+
+const TaskState = enum {
+    ready,
+    // sleeping,
+    // blocked,
+};
+
+const TaskContext = struct {
+    rip: u64,
+    rsp: u64,
+};
+
+const Tcb = struct {
+    state: TaskState = .ready,
+    // wakeup_rdtsc: u64,
+
+    ready_queue_node: std.DoublyLinkedList.Node = .{},
+    context: TaskContext,
+};
+
+const SchedulerState = struct {
+    ready_queue: std.DoublyLinkedList = .{},
+};
+
+var sched_state: SchedulerState = .{};
+var sched_lock: SpinLock = .{};
+
+fn yield(this_thread: *Tcb) void {
+    const next_thread: *Tcb = sched: {
+        sched_lock.lock();
+        defer sched_lock.unlock();
+        // No task switch if there are no other ready threads
+        const next_thread_node = sched_state.ready_queue.popFirst() orelse return;
+        sched_state.ready_queue.append(&this_thread.ready_queue_node);
+        break :sched @fieldParentPtr("ready_queue_node", next_thread_node);
+    };
+
+    taskSwitch(&this_thread.context, &next_thread.context);
+}
+
+fn schedule(thread: *Tcb) void {
+    sched_lock.lock();
+    defer sched_lock.unlock();
+    sched_state.ready_queue.append(&thread.ready_queue_node);
+}
+
+fn schedulerStart() noreturn {
+    const next_thread: *Tcb = sched: {
+        sched_lock.lock();
+        defer sched_lock.unlock();
+        // TODO: Dummy task to run when there are none? Halt?
+        const next_thread_node = sched_state.ready_queue.popFirst() orelse @panic("no thread ready");
+        break :sched @fieldParentPtr("ready_queue_node", next_thread_node);
+    };
+    taskStart(&next_thread.context);
+}
+
+fn taskStart(ctx: *TaskContext) noreturn {
+    asm volatile (
+        \\mov %[restore_rsp], %rsp
+        \\jmp *%[restore_rip]
+        :
+        : [restore_rip] "r" (ctx.rip),
+          [restore_rsp] "r" (ctx.rsp),
+    );
+    // Infinite loop to make the compiler happy
+    while (true) {}
+}
+
+fn taskSwitch(this_ctx: *TaskContext, next_ctx: *TaskContext) void {
+    asm volatile (
+        \\  lea resume, %rax
+        \\  mov %rax, (%[save_rip])
+        \\  mov %rsp, (%[save_rsp])
+        \\
+        \\  mov %[restore_rsp], %rsp
+        \\  jmp *%[restore_rip]
+        \\resume:
+        :
+        : [save_rip] "{rsi}" (&this_ctx.rip),
+          [save_rsp] "{rdi}" (&this_ctx.rsp),
+          [restore_rip] "{rcx}" (next_ctx.rip),
+          [restore_rsp] "{rdx}" (next_ctx.rsp),
+        : .{
+          .rax = true,
+          .rcx = true,
+          .rdx = true,
+          .rbx = true,
+          .rbp = true,
+          .rsi = true,
+          .rdi = true,
+          .r8 = true,
+          .r9 = true,
+          .r10 = true,
+          .r11 = true,
+          .r12 = true,
+          .r13 = true,
+          .r14 = true,
+          .r15 = true,
+          .memory = true,
+        });
 }
 
 fn renderGradient(gradient_win: *ozlib.FrameBuffer, x_offset: i32, y_offset: i32) void {
