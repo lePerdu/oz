@@ -31,11 +31,6 @@ pub const PageTable = extern struct {
     pub fn clear(self: *Self) void {
         @memset(&self.entries, PageTableEntry.EMPTY);
     }
-
-    pub fn setupRecursiveMap(self: *Self, page_num: PageNum) void {
-        // TODO: global? execute_disable?
-        self.entries[ENTRY_COUNT - 1] = PageTableEntry.init(page_num, .{ .writable = true });
-    }
 };
 
 // TODO: Separate structs for PML4, PDPT, and PD entries since some fields

@@ -37,7 +37,7 @@ pub const panic = std.debug.FullPanic(kdebug.panic);
 
 pub const os = struct {
     pub const heap = struct {
-        const page_allocator = kernel_heap_state.allocator();
+        const page_allocator = kernel_heap_state.heap_alloc.allocator();
     };
 };
 
@@ -45,20 +45,7 @@ pub const os = struct {
 /// TODO: Figure out a way to make this non-global
 var kernel_heap_state: struct {
     page_bitmap: ozlib.alloc.PageBitmap = undefined,
-    heap_region: ozlib.alloc.PagedHeapRegion = undefined,
-
-    pub fn allocator(self: *@This()) std.mem.Allocator {
-        // Just takes the self parameter to make the function easier to call
-        _ = self;
-        return .{
-            .ptr = undefined,
-            .vtable = &std.heap.SbrkAllocator(kernel_heap_sbrk).vtable,
-        };
-    }
-
-    fn kernel_heap_sbrk(n: usize) usize {
-        return kernel_heap_state.heap_region.extend(n);
-    }
+    heap_alloc: ozlib.alloc.PagedArenaAllocator = undefined,
 } = .{};
 
 // TODO: Use better timer
@@ -480,18 +467,17 @@ fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt)
 
     var bootstrap_page_alloc = ozlib.alloc.BootinfoMMapPageAllocator.init(mem_map);
     _ = bootstrap_page_alloc.allocPages(early_kernel_reserved_page_count);
-    kernel_heap_state.heap_region = .init(
+    kernel_heap_state.heap_alloc = .init(
         pml4,
         offset_map_base,
         bootstrap_page_alloc.allocator(),
         kernel_heap_vma_start,
         kernel_heap_vma_len,
     );
-    const bootstrap_allocator = kernel_heap_state.allocator();
 
     const page_count = calcAvailableMemoryPages(mem_map);
     log.debug("allocating bitmap data", .{});
-    const bitmap_data = try bootstrap_allocator.alignedAlloc(u8, .fromByteUnits(paging.page_size), page_count);
+    const bitmap_data = try os.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(paging.page_size), page_count);
     log.debug("allocated bitmap data: {*}", .{bitmap_data});
     var bitmap = ozlib.alloc.PageBitmap.init(bitmap_data, page_count);
     // Mark space used for bitmap allocations
@@ -504,7 +490,7 @@ fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt)
 
     kernel_heap_state.page_bitmap = bitmap;
     // Can't use the local variable since .allocator() takes a reference
-    kernel_heap_state.heap_region.page_alloc = kernel_heap_state.page_bitmap.allocator();
+    kernel_heap_state.heap_alloc.page_alloc = kernel_heap_state.page_bitmap.allocator();
 }
 
 fn markInitialUsedPages(bitmap: *ozlib.alloc.PageBitmap, mem_map: []const ozlib.boot.MMapEnt) void {

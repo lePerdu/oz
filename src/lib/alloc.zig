@@ -369,16 +369,17 @@ test BootinfoMMapPageAllocator {
     try std.testing.expectEqual(null, alloc.allocPages(1));
 }
 
-pub const PagedHeapRegion = struct {
+/// Allocate in append-only fashion by mapping pages into a given region
+pub const PagedArenaAllocator = struct {
     pml4: *paging.PageTable,
+    // TODO: Just use the global constant value?
     offset_map_base: paging.VirtualAddress,
     page_alloc: PageAllocator,
     region_base: Addr,
     region_len: usize,
     /// Size of the region that is currently mapped
     mapped_len: usize,
-    /// Previously reported limit
-    limit: Addr,
+    next_free_addr: Addr,
 
     const Self = @This();
     const Addr = paging.VirtualAddress;
@@ -390,8 +391,7 @@ pub const PagedHeapRegion = struct {
         region_base: Addr,
         region_len: usize,
     ) Self {
-        // Due to the limitation of the sbrk() API, the region cannot start at 0
-        std.debug.assert(region_base > 0);
+        std.debug.assert(std.mem.isAligned(region_base, paging.page_size));
         return .{
             .pml4 = pml4,
             .offset_map_base = offset_map_base,
@@ -399,30 +399,42 @@ pub const PagedHeapRegion = struct {
             .region_base = region_base,
             .region_len = region_len,
             .mapped_len = 0,
-            .limit = region_base,
+            .next_free_addr = region_base,
         };
     }
 
-    /// Increases the size of the heap by mapping new memory pages.
-    ///
-    /// Returns the previous extent of the heap, or 0 if the limit could not be extended
-    pub fn extend(self: *Self, n: usize) Addr {
-        // Previous limit is always returned
-        const previous_limit = self.limit;
-        const new_limit = self.limit + n;
+    pub fn allocator(self: *Self) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                // TODO: Impl any of these, at least for the most-recent allocation?
+                .free = std.mem.Allocator.noFree,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+            },
+        };
+    }
 
-        if (new_limit > self.region_base + self.region_len) {
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        _ = ret_addr;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const alloc_start = alignment.forward(self.next_free_addr);
+        const alloc_end = alloc_start + len;
+
+        if (alloc_end > self.region_base + self.region_len) {
             // No more address space
-            return 0;
+            return null;
         }
 
         // Don't need to map more pages
-        if (new_limit <= self.region_base + self.mapped_len) {
-            self.limit = new_limit;
-            return previous_limit;
+        if (alloc_end <= self.region_base + self.mapped_len) {
+            self.next_free_addr = alloc_end;
+            return @ptrFromInt(alloc_start);
         }
 
-        const required_len = new_limit - (self.region_base + self.mapped_len);
+        const required_len = alloc_end - (self.region_base + self.mapped_len);
         const page_count = paging.pagesRequired(required_len);
         const added_region_start = self.region_base + self.mapped_len;
 
@@ -444,8 +456,8 @@ pub const PagedHeapRegion = struct {
         } else {
             // Loop finished, so everything worked
             self.mapped_len += page_count * paging.page_size;
-            self.limit = new_limit;
-            return previous_limit;
+            self.next_free_addr = alloc_end;
+            return @ptrFromInt(alloc_start);
         }
 
         // TODO: Early loop exit means failure, so:
