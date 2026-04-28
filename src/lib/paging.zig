@@ -82,14 +82,6 @@ pub const PageTableEntry = packed struct {
         return pageNumToAddress(self.physical_page_number);
     }
 
-    pub inline fn physicalPtr(self: Self) *align(page_size) anyopaque {
-        return @alignCast(@as(*anyopaque, @ptrFromInt(self.physicalAddress())));
-    }
-
-    pub inline fn physicalPtrAs(self: Self, comptime T: type) *align(page_size) T {
-        return @ptrCast(self.physicalPtr());
-    }
-
     /// Set the physical address bits, verifying that the address is properly aligned
     pub inline fn setPhysicalAddress(self: *Self, address: PhysicalAddress) void {
         self.physical_page_number = addressToPageNum(address);
@@ -205,10 +197,6 @@ test pageNumToAddress {
     try std.testing.expectEqual(0xFF_FFFF_F000, pageNumToAddress(std.math.maxInt(PageNum)));
 }
 
-pub inline fn pageNumToPtr(comptime T: type, page_num: PageNum) *align(4096) T {
-    return @ptrFromInt(pageNumToAddress(page_num));
-}
-
 pub inline fn addressToPageNum(address: PhysicalAddress) PageNum {
     // TODO: Return error instead?
     std.debug.assert(std.mem.isAligned(address, page_size));
@@ -290,32 +278,33 @@ pub const PageLevel = enum { pml4, pdpt, pd, pt };
 
 pub const PageTableVisitor = fn (context: *anyopaque, level: PageLevel, table: *PageTable) error{Break}!void;
 
-pub fn visitPageTables(pml4: *PageTable, context: *anyopaque, visit: PageTableVisitor) void {
-    visit(context, .pml4, pml4) catch return;
-    for (0..512) |pml4_index| {
-        if (!pml4.entries[pml4_index].present) {
-            continue;
-        }
+// TODO: Update to use offset map
+// pub fn visitPageTables(pml4: *PageTable, context: *anyopaque, visit: PageTableVisitor) void {
+//     visit(context, .pml4, pml4) catch return;
+//     for (0..512) |pml4_index| {
+//         if (!pml4.entries[pml4_index].present) {
+//             continue;
+//         }
 
-        const pdpt = pml4.entries[pml4_index].physicalPtrAs(PageTable);
-        visit(context, .pdpt, pdpt) catch return;
-        for (0..512) |pdpt_index| {
-            if (!pdpt.entries[pdpt_index].present or pdpt.entries[pdpt_index].huge_page) {
-                continue;
-            }
+//         const pdpt = pml4.entries[pml4_index].physicalPtrAs(PageTable);
+//         visit(context, .pdpt, pdpt) catch return;
+//         for (0..512) |pdpt_index| {
+//             if (!pdpt.entries[pdpt_index].present or pdpt.entries[pdpt_index].huge_page) {
+//                 continue;
+//             }
 
-            const pd = pdpt.entries[pdpt_index].physicalPtrAs(PageTable);
-            visit(context, .pd, pd) catch return;
-            for (0..512) |pd_index| {
-                if (!pd.entries[pd_index].present or pd.entries[pd_index].huge_page) {
-                    continue;
-                }
-                const pt = pd.entries[pd_index].physicalPtrAs(PageTable);
-                visit(context, .pt, pt) catch return;
-            }
-        }
-    }
-}
+//             const pd = pdpt.entries[pdpt_index].physicalPtrAs(PageTable);
+//             visit(context, .pd, pd) catch return;
+//             for (0..512) |pd_index| {
+//                 if (!pd.entries[pd_index].present or pd.entries[pd_index].huge_page) {
+//                     continue;
+//                 }
+//                 const pt = pd.entries[pd_index].physicalPtrAs(PageTable);
+//                 visit(context, .pt, pt) catch return;
+//             }
+//         }
+//     }
+// }
 
 /// Iterator over all present page mappings in a specified region of virtual
 /// address space
@@ -323,99 +312,99 @@ pub fn visitPageTables(pml4: *PageTable, context: *anyopaque, visit: PageTableVi
 /// Preconditions:
 /// - Memory containing page tables is identity-mapped
 /// TODO: Allow some other scheme, like offset-mapping, or accept a page->addr function
-pub const PageMappingIterator = struct {
-    pml4: *PageTable,
-    pml4_index: usize,
-    pdpt_index: usize,
-    pd_index: usize,
-    pt_index: usize,
-    end_addr: VirtualAddress,
+// pub const PageMappingIterator = struct {
+//     pml4: *PageTable,
+//     pml4_index: usize,
+//     pdpt_index: usize,
+//     pd_index: usize,
+//     pt_index: usize,
+//     end_addr: VirtualAddress,
 
-    const Self = @This();
+//     const Self = @This();
 
-    pub fn init(pml4: *PageTable, start: VirtualAddress, end: VirtualAddress) Self {
-        return Self{
-            .pml4 = pml4,
-            .pml4_index = getPml4Index(start),
-            .pdpt_index = getPdptIndex(start),
-            .pd_index = getPdIndex(start),
-            .pt_index = getPtIndex(start),
-            .end_addr = end,
-        };
-    }
+//     pub fn init(pml4: *PageTable, start: VirtualAddress, end: VirtualAddress) Self {
+//         return Self{
+//             .pml4 = pml4,
+//             .pml4_index = getPml4Index(start),
+//             .pdpt_index = getPdptIndex(start),
+//             .pd_index = getPdIndex(start),
+//             .pt_index = getPtIndex(start),
+//             .end_addr = end,
+//         };
+//     }
 
-    pub fn next(self: *Self) ?PageMapping {
-        const pml4_end = @min(getPml4Index(self.end_addr) + 1, 512);
-        while (self.pml4_index < pml4_end) : (self.pml4_index += 1) {
-            const pml4_ent = &self.pml4.entries[self.pml4_index];
-            if (!pml4_ent.present) {
-                continue;
-            }
+//     pub fn next(self: *Self) ?PageMapping {
+//         const pml4_end = @min(getPml4Index(self.end_addr) + 1, 512);
+//         while (self.pml4_index < pml4_end) : (self.pml4_index += 1) {
+//             const pml4_ent = &self.pml4.entries[self.pml4_index];
+//             if (!pml4_ent.present) {
+//                 continue;
+//             }
 
-            const pdpt = pml4_ent.physicalPtrAs(PageTable);
-            const pdpt_end = @min(getPdptIndex(self.end_addr) + 1, 512);
-            while (self.pdpt_index < pdpt_end) : (self.pdpt_index += 1) {
-                const pdpt_ent = &pdpt.entries[self.pdpt_index];
-                if (!pdpt_ent.present) {
-                    continue;
-                }
-                if (pdpt_ent.huge_page) {
-                    const res = PageMapping{
-                        .entry = pdpt_ent,
-                        .virtual_addr = build1GVirtAddr(self.pml4_index, self.pdpt_index),
-                        .size = .size_1g,
-                    };
-                    self.pdpt_index += 1;
-                    return res;
-                }
+//             const pdpt = pml4_ent.physicalPtrAs(PageTable);
+//             const pdpt_end = @min(getPdptIndex(self.end_addr) + 1, 512);
+//             while (self.pdpt_index < pdpt_end) : (self.pdpt_index += 1) {
+//                 const pdpt_ent = &pdpt.entries[self.pdpt_index];
+//                 if (!pdpt_ent.present) {
+//                     continue;
+//                 }
+//                 if (pdpt_ent.huge_page) {
+//                     const res = PageMapping{
+//                         .entry = pdpt_ent,
+//                         .virtual_addr = build1GVirtAddr(self.pml4_index, self.pdpt_index),
+//                         .size = .size_1g,
+//                     };
+//                     self.pdpt_index += 1;
+//                     return res;
+//                 }
 
-                const pd = pdpt.entries[self.pdpt_index].physicalPtrAs(PageTable);
-                const pd_end = @min(getPdIndex(self.end_addr) + 1, 512);
-                while (self.pd_index < pd_end) : (self.pd_index += 1) {
-                    const pd_ent = &pd.entries[self.pd_index];
-                    if (!pd_ent.present) {
-                        continue;
-                    }
-                    if (pd_ent.huge_page) {
-                        const res = PageMapping{
-                            .entry = pd_ent,
-                            .virtual_addr = build2MVirtAddr(self.pml4_index, self.pdpt_index, self.pd_index),
-                            .size = .size_2m,
-                        };
-                        self.pd_index += 1;
-                        return res;
-                    }
+//                 const pd = pdpt.entries[self.pdpt_index].physicalPtrAs(PageTable);
+//                 const pd_end = @min(getPdIndex(self.end_addr) + 1, 512);
+//                 while (self.pd_index < pd_end) : (self.pd_index += 1) {
+//                     const pd_ent = &pd.entries[self.pd_index];
+//                     if (!pd_ent.present) {
+//                         continue;
+//                     }
+//                     if (pd_ent.huge_page) {
+//                         const res = PageMapping{
+//                             .entry = pd_ent,
+//                             .virtual_addr = build2MVirtAddr(self.pml4_index, self.pdpt_index, self.pd_index),
+//                             .size = .size_2m,
+//                         };
+//                         self.pd_index += 1;
+//                         return res;
+//                     }
 
-                    const pt = pd.entries[self.pd_index].physicalPtrAs(PageTable);
-                    const pt_end = @min(getPtIndex(self.end_addr) + 1, 512);
-                    while (self.pt_index < pt_end) : (self.pt_index += 1) {
-                        const pt_ent = &pt.entries[self.pt_index];
-                        if (!pt_ent.present) {
-                            continue;
-                        }
-                        const res = PageMapping{
-                            .entry = pt_ent,
-                            .virtual_addr = build4KVirtAddr(
-                                self.pml4_index,
-                                self.pdpt_index,
-                                self.pd_index,
-                                self.pt_index,
-                            ),
-                            .size = .size_4k,
-                        };
-                        self.pt_index += 1;
-                        return res;
-                    }
-                    self.pt_index = 0;
-                }
-                self.pd_index = 0;
-            }
-            self.pdpt_index = 0;
-        }
+//                     const pt = pd.entries[self.pd_index].physicalPtrAs(PageTable);
+//                     const pt_end = @min(getPtIndex(self.end_addr) + 1, 512);
+//                     while (self.pt_index < pt_end) : (self.pt_index += 1) {
+//                         const pt_ent = &pt.entries[self.pt_index];
+//                         if (!pt_ent.present) {
+//                             continue;
+//                         }
+//                         const res = PageMapping{
+//                             .entry = pt_ent,
+//                             .virtual_addr = build4KVirtAddr(
+//                                 self.pml4_index,
+//                                 self.pdpt_index,
+//                                 self.pd_index,
+//                                 self.pt_index,
+//                             ),
+//                             .size = .size_4k,
+//                         };
+//                         self.pt_index += 1;
+//                         return res;
+//                     }
+//                     self.pt_index = 0;
+//                 }
+//                 self.pd_index = 0;
+//             }
+//             self.pdpt_index = 0;
+//         }
 
-        return null;
-    }
-};
+//         return null;
+//     }
+// };
 
 pub const AddressResolver = struct {
     context: *const anyopaque,

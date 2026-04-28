@@ -19,7 +19,7 @@
   {
     "label": "Debug in QEMU",
     "command": "zig",
-    "args": ["build", "debug"],
+    "args": ["build", "debug", "--", "-smp", "4"],
     "use_new_terminal": false,
     "allow_concurrent_runs": false
   }

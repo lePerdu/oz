@@ -126,7 +126,7 @@ test "parse PSF1 font" {
     const font_data align(2) = @embedFile("assets/Lat15-Terminus16.psf").*;
     const font = try Psf1Font.parse(testing.allocator, &font_data);
     defer font.deinit(testing.allocator);
-    try testing.expectEqual(16, font.height());
+    try testing.expectEqual(16, font.height);
     try testing.expect(font.unicode_table != null);
     for ('a'..'z') |char| {
         try testing.expect(font.getGlyphBitmap(@intCast(char)) != null);

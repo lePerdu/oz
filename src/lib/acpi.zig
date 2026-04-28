@@ -33,15 +33,6 @@ pub const Rsdp = extern struct {
 
     const Self = @This();
 
-    pub fn rsdtPtr(self: *const Self) *const Rsdt {
-        comptime std.debug.assert(@sizeOf(*anyopaque) == 32);
-        return @ptrFromInt(self.rsdt_addr);
-    }
-
-    pub fn xsdtPtr(self: *const Self) *const Xsdt {
-        return @ptrFromInt(self.xsdt_addr);
-    }
-
     pub fn valid(self: *const @This()) bool {
         return self.signatureValid() and self.versionValid() and self.checksumValid();
     }
@@ -104,27 +95,30 @@ pub const Xsdt = extern struct {
     header: DescriptionHeader,
     _entries: [0]u64 align(4),
 
-    pub fn entries(self: *const @This()) []align(4) const *const DescriptionHeader {
+    fn entries(self: *const @This()) []align(4) const u64 {
         const entryElem = std.meta.Elem(@TypeOf(self._entries));
-        comptime std.debug.assert(@sizeOf(*anyopaque) == @sizeOf(entryElem));
-        const raw_ptr: [*]align(4) const u8 = @ptrCast(&self._entries);
-        // const raw_ptr: [*]align(4) const u8 = @ptrFromInt(@intFromPtr(self) + @sizeOf(@This()));
-        const raw_len = self.header.length - @sizeOf(@This());
-        return std.mem.bytesAsSlice(*const DescriptionHeader, raw_ptr[0..raw_len]);
+        // TODO: Is there a "length-cast" operation?
+        const raw_ptr: [*]align(4) const u64 = @ptrCast(&self._entries);
+
+        const len_bytes = self.header.length - @sizeOf(@This());
+        std.debug.assert(len_bytes % @sizeOf(entryElem) == 0);
+        const len = len_bytes / @sizeOf(entryElem);
+        return raw_ptr[0..len];
     }
 
-    pub fn findTypedTable(self: *const @This(), table_type: type) ?*const table_type {
+    pub fn findTypedTable(self: *const @This(), offset: u64, table_type: type) ?*const table_type {
         if (!@hasDecl(table_type, "SIGNATURE")) {
             @compileError("Xsdt.findTable: table type must have decl: `SIGNATURE: [4]u8`");
         }
         const signature: [4]u8 = @field(table_type, "SIGNATURE");
 
-        const header_ptr = self.findTable(signature) orelse return null;
+        const header_ptr = self.findTable(offset, signature) orelse return null;
         return @ptrCast(header_ptr);
     }
 
-    pub fn findTable(self: *const @This(), signature: [4]u8) ?*const DescriptionHeader {
-        for (self.entries()) |entry| {
+    pub fn findTable(self: *const @This(), offset: u64, signature: [4]u8) ?*const DescriptionHeader {
+        for (self.entries()) |entry_addr| {
+            const entry: *DescriptionHeader = @ptrFromInt(offset + entry_addr);
             if (entry.valid(signature)) {
                 return entry;
             }
@@ -147,16 +141,13 @@ pub const Fadt = extern struct {
 
     const Self = @This();
 
-    pub fn dsdtPtr(self: *const Self) *const Dsdt {
+    pub fn dsdtAddr(self: *const Self) u64 {
         if (comptime @sizeOf(*anyopaque) == 64) {
             if (self.x_dsdt_addr != 0) {
-                return @ptrFromInt(self.x_dsdt_addr);
-            } else {
-                return @ptrFromInt(self.dsdt_addr);
+                return self.x_dsdt_addr;
             }
-        } else {
-            return @ptrFromInt(self.dsdt_addr);
         }
+        return self.dsdt_addr;
     }
 
     comptime {

@@ -367,6 +367,8 @@ fn createIdentityPageTables(page_count: usize) !*paging.PageTable {
         const large_page_count = paging.pageEntriesRequired(page_count);
         const page_dirs = paging.pageEntriesRequired(large_page_count);
         const page_dir_pointers = paging.pageEntriesRequired(page_dirs);
+        // TODO: Support > 512GB RAM by using more than pml4[0]
+        std.debug.assert(page_dir_pointers == 1);
         const page_map_level_4s = paging.pageEntriesRequired(page_dir_pointers);
         std.debug.assert(page_map_level_4s == 1);
 
@@ -380,9 +382,8 @@ fn createIdentityPageTables(page_count: usize) !*paging.PageTable {
     const ptr2Page = paging.pointerToPageNum;
 
     const pml4 = allocator.next().?;
-    init_loop: for (0..511) |pml4_index| {
-        // Only iterate to 511 since the last entry in PML4 is recursive
-        // (Doesn't really matter anyway since no compute has that much RAM)
+    // TODO: Support > 512GB RAM by using more than pml4[0]
+    init_loop: for (0..1) |pml4_index| {
         const pdpt = allocator.next().?;
         pml4.entries[pml4_index] = initSmallPage(ptr2Page(pdpt));
 

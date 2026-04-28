@@ -198,7 +198,7 @@ test "PageBitmap: isUsed() after markUsed()" {
 test "PageBitmap: isUsed() after alloc()" {
     var data: [32]u8 = undefined;
     var bitmap = PageBitmap.init(&data, 256);
-    const allocated = try bitmap.alloc();
+    const allocated = try bitmap.allocator().alloc();
     for (0..bitmap.page_count) |p| {
         if (p == allocated) {
             try std.testing.expect(bitmap.isUsed(@intCast(p)));
@@ -211,9 +211,9 @@ test "PageBitmap: isUsed() after alloc()" {
 test "PageBitmap: isUsed() after free()" {
     var data: [32]u8 = undefined;
     var bitmap = PageBitmap.init(&data, 256);
-    const freed = try bitmap.alloc();
-    const allocated = try bitmap.alloc();
-    bitmap.free(freed);
+    const freed = try bitmap.allocator().alloc();
+    const allocated = try bitmap.allocator().alloc();
+    bitmap.allocator().free(freed);
     for (0..bitmap.page_count) |p| {
         if (p == allocated) {
             try std.testing.expect(bitmap.isUsed(@intCast(p)));
@@ -226,8 +226,8 @@ test "PageBitmap: isUsed() after free()" {
 test "PageBitmap: sequential alloc() does not return same page" {
     var data: [32]u8 = undefined;
     var bitmap = PageBitmap.init(&data, 256);
-    const a1 = try bitmap.alloc();
-    const a2 = try bitmap.alloc();
+    const a1 = try bitmap.allocator().alloc();
+    const a2 = try bitmap.allocator().alloc();
     try std.testing.expect(a1 != a2);
 }
 
@@ -235,10 +235,10 @@ test "PageBitmap: alloc() can allocate page_count pages" {
     var data: [32]u8 = undefined;
     var bitmap = PageBitmap.init(&data, 256);
     for (0..bitmap.page_count) |_| {
-        _ = try bitmap.alloc();
+        _ = try bitmap.allocator().alloc();
     }
 
-    try std.testing.expectError(error.OutOfMemory, bitmap.alloc());
+    try std.testing.expectError(error.OutOfMemory, bitmap.allocator().alloc());
 }
 
 test "PageBitmap: alloc() can allocate page_count pages when page_count < data buffer size" {
@@ -246,10 +246,10 @@ test "PageBitmap: alloc() can allocate page_count pages when page_count < data b
     var bitmap = PageBitmap.init(&data, 240);
     try std.testing.expectEqual(240, bitmap.page_count);
     for (0..bitmap.page_count) |_| {
-        _ = try bitmap.alloc();
+        _ = try bitmap.allocator().alloc();
     }
 
-    try std.testing.expectError(error.OutOfMemory, bitmap.alloc());
+    try std.testing.expectError(error.OutOfMemory, bitmap.allocator().alloc());
 }
 
 test "PageBitmap: alloc() can allocate page_count pages when page_count not a multiple of chunk size" {
@@ -257,10 +257,10 @@ test "PageBitmap: alloc() can allocate page_count pages when page_count not a mu
     var bitmap = PageBitmap.init(&data, 211);
     try std.testing.expectEqual(211, bitmap.page_count);
     for (0..bitmap.page_count) |_| {
-        _ = try bitmap.alloc();
+        _ = try bitmap.allocator().alloc();
     }
 
-    try std.testing.expectError(error.OutOfMemory, bitmap.alloc());
+    try std.testing.expectError(error.OutOfMemory, bitmap.allocator().alloc());
 }
 
 test "PageBitmap: alloc() can re-use page after free()" {
@@ -268,20 +268,20 @@ test "PageBitmap: alloc() can re-use page after free()" {
     var bitmap = PageBitmap.init(&data, 256);
     // Fill up allocator
     for (0..bitmap.page_count) |_| {
-        _ = try bitmap.alloc();
+        _ = try bitmap.allocator().alloc();
     }
 
-    bitmap.free(5);
-    bitmap.free(10);
-    bitmap.free(15);
-    bitmap.free(11);
+    bitmap.allocator().free(5);
+    bitmap.allocator().free(10);
+    bitmap.allocator().free(15);
+    bitmap.allocator().free(11);
 
-    _ = try bitmap.alloc();
-    _ = try bitmap.alloc();
-    _ = try bitmap.alloc();
-    _ = try bitmap.alloc();
+    _ = try bitmap.allocator().alloc();
+    _ = try bitmap.allocator().alloc();
+    _ = try bitmap.allocator().alloc();
+    _ = try bitmap.allocator().alloc();
 
-    try std.testing.expectError(error.OutOfMemory, bitmap.alloc());
+    try std.testing.expectError(error.OutOfMemory, bitmap.allocator().alloc());
 }
 
 /// Simple whole-page allocator that only relies on the memory map and a pointer
@@ -364,13 +364,14 @@ test BootinfoMMapPageAllocator {
     // Skips to next descriptor
     try std.testing.expectEqual(0x18, alloc.allocPages(3));
     // Only space for 1 more page
-    try std.testing.expectError(error.OutOfMemory, alloc.allocPages(2));
+    try std.testing.expectEqual(null, alloc.allocPages(2));
     // Doesn't look for un-used space after OOM
-    try std.testing.expectError(error.OutOfMemory, alloc.allocPages(1));
+    try std.testing.expectEqual(null, alloc.allocPages(1));
 }
 
 pub const PagedHeapRegion = struct {
     pml4: *paging.PageTable,
+    offset_map_base: paging.VirtualAddress,
     page_alloc: PageAllocator,
     region_base: Addr,
     region_len: usize,
@@ -382,11 +383,18 @@ pub const PagedHeapRegion = struct {
     const Self = @This();
     const Addr = paging.VirtualAddress;
 
-    pub fn init(pml4: *paging.PageTable, page_alloc: PageAllocator, region_base: Addr, region_len: usize) Self {
+    pub fn init(
+        pml4: *paging.PageTable,
+        offset_map_base: paging.VirtualAddress,
+        page_alloc: PageAllocator,
+        region_base: Addr,
+        region_len: usize,
+    ) Self {
         // Due to the limitation of the sbrk() API, the region cannot start at 0
         std.debug.assert(region_base > 0);
         return .{
             .pml4 = pml4,
+            .offset_map_base = offset_map_base,
             .page_alloc = page_alloc,
             .region_base = region_base,
             .region_len = region_len,
@@ -430,7 +438,7 @@ pub const PagedHeapRegion = struct {
             });
             const map_addr: Addr = added_region_start + page_offset * paging.page_size;
             // Returns a slice for the mapped region, which isn't important here
-            _ = map4KPage(self.pml4, self.page_alloc, page_entry, map_addr) catch {
+            _ = map4KPage(self.pml4, self.offset_map_base, self.page_alloc, page_entry, map_addr) catch {
                 break;
             };
         } else {
@@ -448,8 +456,13 @@ pub const PagedHeapRegion = struct {
     }
 };
 
+fn pageNumToPtr(comptime T: type, offset: paging.VirtualAddress, page: paging.PageNum) *T {
+    return @ptrFromInt(offset + paging.pageNumToAddress(page));
+}
+
 fn map4KPage(
     pml4: *paging.PageTable,
+    offset_map_base: paging.VirtualAddress,
     page_alloc: PageAllocator,
     page_entry: paging.PageTableEntry,
     virt_addr: paging.VirtualAddress,
@@ -460,7 +473,7 @@ fn map4KPage(
     const pml4_index = paging.getPml4Index(virt_addr);
     if (!pml4.entries[pml4_index].present) {
         const pdpt_page = try page_alloc.alloc();
-        const pdpt = paging.pageNumToPtr(paging.PageTable, pdpt_page);
+        const pdpt = pageNumToPtr(paging.PageTable, offset_map_base, pdpt_page);
         pdpt.clear();
         log.debug("allocated PDPT: {*}", .{pdpt});
         pml4.entries[pml4_index] = page_entry.withPageNum(pdpt_page);
@@ -468,33 +481,33 @@ fn map4KPage(
         return error.AlreadyMapped;
     }
 
-    const pdpt = pml4.entries[pml4_index].physicalPtrAs(paging.PageTable);
+    const pdpt = pageNumToPtr(paging.PageTable, offset_map_base, pml4.entries[pml4_index].physical_page_number);
     const pdpt_index = paging.getPdptIndex(virt_addr);
     if (!pdpt.entries[pdpt_index].present) {
         const pd_page = try page_alloc.alloc();
-        const pd = paging.pageNumToPtr(paging.PageTable, pd_page);
+        const pd = pageNumToPtr(paging.PageTable, offset_map_base, pd_page);
         pd.clear();
         log.debug("allocated PD: {*}", .{pd});
-        paging.pageNumToPtr(paging.PageTable, pd_page).clear();
+        pageNumToPtr(paging.PageTable, offset_map_base, pd_page).clear();
         pdpt.entries[pdpt_index] = page_entry.withPageNum(pd_page);
     } else if (pdpt.entries[pdpt_index].huge_page) {
         return error.AlreadyMapped;
     }
 
-    const pd = pdpt.entries[pdpt_index].physicalPtrAs(paging.PageTable);
+    const pd = pageNumToPtr(paging.PageTable, offset_map_base, pdpt.entries[pdpt_index].physical_page_number);
     const pd_index = paging.getPdIndex(virt_addr);
     if (!pd.entries[pd_index].present) {
         const pt_page = try page_alloc.alloc();
-        const pt = paging.pageNumToPtr(paging.PageTable, pt_page);
+        const pt = pageNumToPtr(paging.PageTable, offset_map_base, pt_page);
         pt.clear();
         log.debug("allocated PT: {*}", .{pt});
-        paging.pageNumToPtr(paging.PageTable, pt_page).clear();
+        pageNumToPtr(paging.PageTable, offset_map_base, pt_page).clear();
         pd.entries[pd_index] = page_entry.withPageNum(pt_page);
     } else if (pd.entries[pd_index].huge_page) {
         return error.AlreadyMapped;
     }
 
-    const pt = pd.entries[pd_index].physicalPtrAs(paging.PageTable);
+    const pt = pageNumToPtr(paging.PageTable, offset_map_base, pd.entries[pd_index].physical_page_number);
     const pt_index = paging.getPtIndex(virt_addr);
     if (pt.entries[pt_index].present) {
         return error.AlreadyMapped;

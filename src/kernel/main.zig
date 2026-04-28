@@ -121,23 +121,29 @@ export fn main() callconv(upcall) noreturn {
     std.log.info("Hello, kernel!", .{});
     std.log.info("Kernel size: {} B ({} KiB)", .{ getKernelSize(), getKernelSize() / 1024 });
 
+    convertIdentityToOffsetMap();
+    // At this point, all physical addresses should be adjusted before being accessed
+    const pml4: *paging.PageTable = @ptrFromInt(offset_map_base + paging.getRootPageTable());
+
     _configurePat();
     collectProcessorInfo();
 
-    const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
-
+    std.log.info("setupKernelHeap", .{});
     setupKernelHeap(pml4, bootinfo.mmapEntries()) catch |err| {
         std.log.err("failed setting up heap: {}", .{err});
         kdebug.halt();
     };
 
     // TODO: Figure out why interruts are coming in while configuring the PS/2 devices
+    std.log.info("setupInterrupts", .{});
     setupInterrupts() catch |err| {
         std.log.err("failed to setup GDT and IDT: {}", .{err});
         kdebug.halt();
     };
+    std.log.info("testInterrupts", .{});
     asm volatile ("int $0x32" ::: .{ .memory = true });
 
+    std.log.info("setup PIC", .{});
     int.pic.configure();
     int.pic.setMask(0xFFFF);
 
@@ -242,6 +248,17 @@ export fn main() callconv(upcall) noreturn {
     // std.log.info("done", .{});
     // kdebug.halt();
 }
+
+// fn createTaskPageTable(kernel_pml4: *const paging.PageTable) !*paging.PageTable {
+//     const pml4 = try os.heap.page_allocator.create(paging.PageTable);
+//     pml4.clear();
+//     // Same upper half as kernel
+//     // TODO: Limit this to some subset?
+//     @memcpy(&pml4.entries[256], &kernel_pml4[256]);
+
+//     // Stack page
+//     return pml4;
+// }
 
 var render1_tcb: Tcb = undefined;
 var render2_tcb: Tcb = undefined;
@@ -438,6 +455,17 @@ fn renderGradient(gradient_win: *ozlib.FrameBuffer, x_offset: i32, y_offset: i32
     }
 }
 
+pub const offset_map_base: paging.VirtualAddress = 0xFFFF_8000_0000_0000;
+// 1 PDPT. TODO: Support more?
+pub const offset_map_max_len: usize = 512 << 30;
+pub const offset_map_end: paging.VirtualAddress = offset_map_base + offset_map_max_len;
+
+fn convertIdentityToOffsetMap() void {
+    const pml4: *paging.PageTable = @ptrFromInt(paging.getRootPageTable());
+    pml4.entries[paging.getPml4Index(offset_map_base)] = pml4.entries[0];
+    pml4.entries[0] = .EMPTY;
+}
+
 pub const kernel_heap_vma_start: paging.VirtualAddress = 0xFFFF_C000_0000_0000;
 pub const kernel_heap_vma_end: paging.VirtualAddress = ozlib.boot.mmio_start;
 pub const kernel_heap_vma_len: usize = kernel_heap_vma_end - kernel_heap_vma_start;
@@ -454,6 +482,7 @@ fn setupKernelHeap(pml4: *paging.PageTable, mem_map: []const ozlib.boot.MMapEnt)
     _ = bootstrap_page_alloc.allocPages(early_kernel_reserved_page_count);
     kernel_heap_state.heap_region = .init(
         pml4,
+        offset_map_base,
         bootstrap_page_alloc.allocator(),
         kernel_heap_vma_start,
         kernel_heap_vma_len,
@@ -1148,6 +1177,7 @@ var bspDone: std.atomic.Value(bool) = .init(false);
 extern const _ap_trampoline: u8;
 extern const _ap_trampoline_end: u8;
 
+// TODO: Import these as offsets in the first place
 /// CR3 has to have a 32-bit address
 extern var _ap_arg_cr3: u32;
 extern var _ap_arg_gdtr: int.DescriptorTableRegister;
@@ -1155,9 +1185,13 @@ extern var _ap_arg_sp: u64;
 
 const ap_trampoline_load_addr = 0x8000;
 
+fn offsetApArg(comptime T: type, phys_ptr: *T) *T {
+    return @ptrFromInt(offset_map_base + @intFromPtr(phys_ptr));
+}
+
 const LocalApic = ozlib.interrupt.apic.Local;
 // Initialize with default address, can be overridden later
-var local_apic: *volatile LocalApic = @ptrFromInt(0xFEE0_0000);
+var local_apic: *volatile LocalApic = @ptrFromInt(offset_map_base + 0xFEE0_0000);
 
 // Mappings between APIC IDs (which may be sparse) to "processor indices" from 0..numcores
 // TODO: Encapsulate this info better?
@@ -1212,22 +1246,22 @@ fn configureIoApic() void {
 }
 
 fn collectProcessorInfo() void {
-    const rsdp: *const ozlib.acpi.Rsdp = @ptrFromInt(bootinfo.acpi_ptr);
+    const rsdp: *const ozlib.acpi.Rsdp = @ptrFromInt(offset_map_base + bootinfo.acpi_ptr);
 
     if (!rsdp.valid()) {
         std.log.warn("RSDP invalid: {}", .{rsdp});
         return;
     }
 
-    const xsdt = rsdp.xsdtPtr();
+    const xsdt: *const ozlib.acpi.Xsdt = @ptrFromInt(offset_map_base + rsdp.xsdt_addr);
     if (!xsdt.header.valid(ozlib.acpi.Xsdt.SIGNATURE)) {
         std.log.warn("XSDT invalid: {}", .{xsdt});
         return;
     }
 
-    const madt: *const ozlib.acpi.Madt = xsdt.findTypedTable(ozlib.acpi.Madt) orelse return;
+    const madt: *const ozlib.acpi.Madt = xsdt.findTypedTable(offset_map_base, ozlib.acpi.Madt) orelse return;
     // Can use this directly since pages are identity-mapped
-    local_apic = @ptrFromInt(madt.local_controller_addr);
+    local_apic = @ptrFromInt(offset_map_base + madt.local_controller_addr);
     var madt_iter = madt.iterator();
     while (madt_iter.next()) |controller| {
         std.log.debug("found controller: {}", .{controller});
@@ -1243,7 +1277,7 @@ fn collectProcessorInfo() void {
                 }
             },
             .local_apic_address_override => |override| {
-                local_apic = @ptrFromInt(override.addr);
+                local_apic = @ptrFromInt(offset_map_base + override.addr);
             },
             .io_apic => |io| {
                 // Don't override an exising (SAPIC) entry
@@ -1252,20 +1286,20 @@ fn collectProcessorInfo() void {
                         .id = io.id,
                         // TODO: Check, don't cast
                         .irq_base = @intCast(io.interrupt_base),
-                        .regs = @ptrFromInt(io.addr),
+                        .regs = @ptrFromInt(offset_map_base + io.addr),
                     });
                 }
             },
             .io_sapic => |io| {
                 // Update address if necessary
                 if (findIoApicById(io.id)) |existing| {
-                    existing.regs = @ptrFromInt(io.addr);
+                    existing.regs = @ptrFromInt(offset_map_base + io.addr);
                 } else {
                     io_apics.appendAssumeCapacity(.{
                         .id = io.id,
                         // TODO: Check, don't cast
                         .irq_base = @intCast(io.interrupt_base),
-                        .regs = @ptrFromInt(io.addr),
+                        .regs = @ptrFromInt(offset_map_base + io.addr),
                     });
                 }
             },
@@ -1294,17 +1328,27 @@ fn startupAps() !void {
     // TODO: Don't allocate stack page for BSP?
     const ap_stack_pages = try os.heap.page_allocator.alignedAlloc([4096]u8, .fromByteUnits(4096), numcores);
 
+    const kernel_pml4: *paging.PageTable = @ptrFromInt(offset_map_base + ozlib.paging.getRootPageTable());
+
+    // Need identity mapping for startup code
+    const ap_pml4_page = try kernel_heap_state.page_bitmap.allocator().alloc();
+    defer kernel_heap_state.page_bitmap.allocator().free(ap_pml4_page);
+
+    const ap_pml4_addr = paging.pageNumToAddress(ap_pml4_page);
+    const ap_pml4: *paging.PageTable = @ptrFromInt(offset_map_base + ap_pml4_addr);
+    @memcpy(&ap_pml4.entries, &kernel_pml4.entries);
+    ap_pml4.entries[0] = kernel_pml4.entries[paging.getPml4Index(offset_map_base)];
+
     // TODO: Check mem map to make sure this is free (or dynamically allocate it)
-    const ap_trampoline_page: *[4096]u8 align(4096) = @ptrFromInt(ap_trampoline_load_addr);
+    const ap_trampoline_page: *[4096]u8 align(4096) = @ptrFromInt(offset_map_base + ap_trampoline_load_addr);
     std.log.debug("ap_load_addr: {*}", .{ap_trampoline_page});
     const ap_trampoline_len = @intFromPtr(&_ap_trampoline_end) - @intFromPtr(&_ap_trampoline);
     @memcpy(ap_trampoline_page[0..ap_trampoline_len], @as([*]const u8, @ptrCast(&_ap_trampoline)));
 
-    const pml4_addr = ozlib.paging.getRootPageTable();
     // TODO: Ensure this when allocating
-    std.debug.assert(pml4_addr <= std.math.maxInt(u32));
-    _ap_arg_cr3 = @truncate(pml4_addr);
-    _ap_arg_gdtr = int.getGdtr();
+    std.debug.assert(ap_pml4_addr <= std.math.maxInt(u32));
+    offsetApArg(u32, &_ap_arg_cr3).* = @truncate(ap_pml4_addr);
+    offsetApArg(int.DescriptorTableRegister, &_ap_arg_gdtr).* = int.getGdtr();
 
     configureLocalApic();
     const bsp_apic_id = local_apic.getId();
@@ -1318,7 +1362,7 @@ fn startupAps() !void {
         if (lapic_id == bsp_apic_id) continue;
 
         const stack_page = &ap_stack_pages[proc_index];
-        _ap_arg_sp = @intFromPtr(stack_page) + stack_page.len;
+        offsetApArg(u64, &_ap_arg_sp).* = @intFromPtr(stack_page) + stack_page.len;
 
         apReady.store(false, .release);
         std.log.info("starting AP: LAPIC={}", .{lapic_id});
