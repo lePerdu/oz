@@ -206,23 +206,24 @@ export fn main() callconv(upcall) noreturn {
 
     logTscFreq();
 
-    const stacks = os.heap.page_allocator.alignedAlloc([4096]u8, .fromByteUnits(16), 2) catch {
-        halt();
-    };
     render1_tcb = .{
         .context = .{
+            .pml4 = createTaskPageTable(pml4) catch halt(),
             .rip = @intFromPtr(&renderLoop),
-            .rsp = @intFromPtr(&stacks[0][0]) + 4096,
+            .rsp = 0x4000_0000_0000,
         },
     };
     schedule(&render1_tcb);
     render2_tcb = .{
         .context = .{
+            .pml4 = createTaskPageTable(pml4) catch halt(),
             .rip = @intFromPtr(&renderLoop2),
-            .rsp = @intFromPtr(&stacks[1][0]) + 4096,
+            .rsp = 0x4000_0000_0000,
         },
     };
     schedule(&render2_tcb);
+
+    sched_state.kernel_pml4 = ozlib.paging.getRootPageTable();
     schedulerStart();
 
     // switch (kallocator.deinit()) {
@@ -236,16 +237,56 @@ export fn main() callconv(upcall) noreturn {
     // kdebug.halt();
 }
 
-// fn createTaskPageTable(kernel_pml4: *const paging.PageTable) !*paging.PageTable {
-//     const pml4 = try os.heap.page_allocator.create(paging.PageTable);
-//     pml4.clear();
-//     // Same upper half as kernel
-//     // TODO: Limit this to some subset?
-//     @memcpy(&pml4.entries[256], &kernel_pml4[256]);
+fn createTaskPageTable(kernel_pml4: *const paging.PageTable) !paging.PhysicalAddress {
+    const page_alloc = kernel_heap_state.page_bitmap.allocator();
 
-//     // Stack page
-//     return pml4;
-// }
+    // NOTE: does not cleanup on error
+    // NOTE: does not clear stack/data pages
+    const pml4_page = try page_alloc.alloc();
+    const pml4: *paging.PageTable = @ptrFromInt(offset_map_base + paging.pageNumToAddress(pml4_page));
+    pml4.clear();
+
+    // Same upper half as kernel
+    @memcpy(pml4.entries[256..], kernel_pml4.entries[256..]);
+
+    // Stack
+    // TODO: Can it be right up to the end? Does that cause cannonical address issues?
+    const stack_page = try page_alloc.alloc();
+    try ozlib.alloc.map4KPage(pml4, offset_map_base, page_alloc, .init(0, .{
+        .writable = true,
+        .execute_disabled = true,
+        .user_access = true,
+    }), .init(stack_page, .{
+        .writable = true,
+        .execute_disabled = true,
+        .user_access = true,
+    }), 0x4000_0000_0000 - 4096);
+
+    // Framebuffer
+    // TODO: Use large pages? Can the mappings be in WC mode in that case?
+    const fb_page_base = bootinfo.fb_ptr / 4096;
+    const fb_page_count = std.math.divCeil(u32, bootinfo.fb_size, 4096) catch undefined;
+    const fb_map_base: paging.VirtualAddress = 0x10_0000;
+    for (0..fb_page_count) |page_offset| {
+        const page: u28 = @intCast(fb_page_base + page_offset);
+        const addr = fb_map_base + page_offset * 4096;
+        try ozlib.alloc.map4KPage(pml4, offset_map_base, page_alloc, .init(0, .{
+            .writable = true,
+            .execute_disabled = true,
+            .user_access = true,
+        }), .init(page, .{
+            // WC mode
+            .huge_page = true,
+            .cache_disabled = true,
+            .write_through = true,
+
+            .writable = true,
+            .execute_disabled = true,
+            .user_access = true,
+        }), addr);
+    }
+    return paging.pageNumToAddress(pml4_page);
+}
 
 var render1_tcb: Tcb = undefined;
 var render2_tcb: Tcb = undefined;
@@ -320,6 +361,7 @@ const TaskState = enum {
 };
 
 const TaskContext = struct {
+    pml4: paging.PhysicalAddress,
     rip: u64,
     rsp: u64,
 };
@@ -334,6 +376,7 @@ const Tcb = struct {
 
 const SchedulerState = struct {
     ready_queue: std.DoublyLinkedList = .{},
+    kernel_pml4: paging.PhysicalAddress = 0,
 };
 
 var sched_state: SchedulerState = .{};
@@ -370,6 +413,7 @@ fn schedulerStart() noreturn {
 }
 
 fn taskStart(ctx: *TaskContext) noreturn {
+    ozlib.paging.setRootPageTable(ctx.pml4);
     asm volatile (
         \\mov %[restore_rsp], %rsp
         \\jmp *%[restore_rip]
@@ -383,6 +427,8 @@ fn taskStart(ctx: *TaskContext) noreturn {
 
 fn taskSwitch(this_ctx: *TaskContext, next_ctx: *TaskContext) void {
     asm volatile (
+    // Have to do this in ASM since the stack will be invalid after changing the page table
+        \\  mov %[new_pml4], %cr3
         \\  lea resume, %rax
         \\  mov %rax, (%[save_rip])
         \\  mov %rsp, (%[save_rsp])
@@ -393,6 +439,7 @@ fn taskSwitch(this_ctx: *TaskContext, next_ctx: *TaskContext) void {
         :
         : [save_rip] "{rsi}" (&this_ctx.rip),
           [save_rsp] "{rdi}" (&this_ctx.rsp),
+          [new_pml4] "{rax}" (next_ctx.pml4),
           [restore_rip] "{rcx}" (next_ctx.rip),
           [restore_rsp] "{rdx}" (next_ctx.rsp),
         : .{

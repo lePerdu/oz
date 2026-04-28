@@ -97,7 +97,7 @@ pub fn getRootPageTable() PhysicalAddress {
     return cr3;
 }
 
-pub fn setRootPageTable(addr: PhysicalAddress) void {
+pub inline fn setRootPageTable(addr: PhysicalAddress) void {
     asm volatile ("mov %[addr], %cr3"
         :
         : [addr] "r" (addr),

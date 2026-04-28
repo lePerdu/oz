@@ -447,10 +447,12 @@ pub const PagedArenaAllocator = struct {
             const page_entry = paging.PageTableEntry.init(page, .{
                 .writable = true,
                 .execute_disabled = true,
+                // TODO: Set global flag for kernel structures
+                // TODO: Set global flag for kernel code/stack pages as well
+                // .global = true,
             });
             const map_addr: Addr = added_region_start + page_offset * paging.page_size;
-            // Returns a slice for the mapped region, which isn't important here
-            _ = map4KPage(self.pml4, self.offset_map_base, self.page_alloc, page_entry, map_addr) catch {
+            map4KPage(self.pml4, self.offset_map_base, self.page_alloc, page_entry, page_entry, map_addr) catch {
                 break;
             };
         } else {
@@ -472,13 +474,14 @@ fn pageNumToPtr(comptime T: type, offset: paging.VirtualAddress, page: paging.Pa
     return @ptrFromInt(offset + paging.pageNumToAddress(page));
 }
 
-fn map4KPage(
+pub fn map4KPage(
     pml4: *paging.PageTable,
     offset_map_base: paging.VirtualAddress,
     page_alloc: PageAllocator,
+    page_table_entry_flags: paging.PageTableEntry,
     page_entry: paging.PageTableEntry,
     virt_addr: paging.VirtualAddress,
-) !*align(4096) anyopaque {
+) !void {
     const log = std.log.scoped(.map4kPage);
     log.debug("start: pml4={*} page={} vaddr={x:016}", .{ pml4, page_entry.physical_page_number, virt_addr });
     defer log.debug("done", .{});
@@ -488,7 +491,7 @@ fn map4KPage(
         const pdpt = pageNumToPtr(paging.PageTable, offset_map_base, pdpt_page);
         pdpt.clear();
         log.debug("allocated PDPT: {*}", .{pdpt});
-        pml4.entries[pml4_index] = page_entry.withPageNum(pdpt_page);
+        pml4.entries[pml4_index] = page_table_entry_flags.withPageNum(pdpt_page);
     } else if (pml4.entries[pml4_index].huge_page) {
         return error.AlreadyMapped;
     }
@@ -501,7 +504,7 @@ fn map4KPage(
         pd.clear();
         log.debug("allocated PD: {*}", .{pd});
         pageNumToPtr(paging.PageTable, offset_map_base, pd_page).clear();
-        pdpt.entries[pdpt_index] = page_entry.withPageNum(pd_page);
+        pdpt.entries[pdpt_index] = page_table_entry_flags.withPageNum(pd_page);
     } else if (pdpt.entries[pdpt_index].huge_page) {
         return error.AlreadyMapped;
     }
@@ -514,7 +517,7 @@ fn map4KPage(
         pt.clear();
         log.debug("allocated PT: {*}", .{pt});
         pageNumToPtr(paging.PageTable, offset_map_base, pt_page).clear();
-        pd.entries[pd_index] = page_entry.withPageNum(pt_page);
+        pd.entries[pd_index] = page_table_entry_flags.withPageNum(pt_page);
     } else if (pd.entries[pd_index].huge_page) {
         return error.AlreadyMapped;
     }
@@ -526,5 +529,4 @@ fn map4KPage(
     }
 
     pt.entries[pt_index] = page_entry;
-    return @ptrFromInt(virt_addr);
 }
